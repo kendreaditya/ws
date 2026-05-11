@@ -23,6 +23,8 @@ _ws() {
     'init-remote:ssh into homelab and git init --bare'
     'reclone:Re-clone a repo (backup, re-clone, confirm)'
     'explain:Show resolved config for a repo'
+    'audit:Classify ~/workspace/* entries (read-only)'
+    'adopt:Interactive walk to classify unmanaged entries'
     'help:Show help'
     'version:Show ws version'
   )
@@ -124,6 +126,19 @@ _ws() {
               '--itemize[pass --itemize-changes to rsync]' \
               '*:project:_ws_repos'
           fi
+          ;;
+        audit)
+          _arguments \
+            '--source[filter to entries whose origin matches this source]:source:_ws_sources' \
+            '--category[filter to one category]:category:(managed skipped third-party local-only data loose unmanaged)' \
+            '--json[NDJSON output]'
+          ;;
+        adopt)
+          _arguments \
+            '--only-category[walk only one category]:category:(third-party local-only data loose)' \
+            '--dry-run[walk + prompt, do not write]' \
+            '--revert[restore config.json from most recent backup]' \
+            '1::entry name:_ws_repos'
           ;;
       esac
       ;;

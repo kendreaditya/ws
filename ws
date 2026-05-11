@@ -83,6 +83,8 @@ COMMANDS
   init-remote <name>     ssh into homelab and `git init --bare` for a new repo
   reclone <name>         Re-clone a repo (backup, re-clone, confirm before delete)
   explain <name>         Show resolved config (source + project) for a repo
+  audit                  Classify ~/workspace/* entries (read-only dashboard)
+  adopt [name]           Interactive walk to classify unmanaged entries
 
 GLOBAL
   --config <path>        Override config (default: ~/.config/ws/config.json)
@@ -110,6 +112,17 @@ git OPTIONS
 
 push / pull / prune / stale OPTIONS
   --source / --only / --all  Same scoping rules as `git`
+
+audit OPTIONS
+  --source <name>        Filter by entries whose origin matches this source
+  --category <c>         managed | skipped | third-party | local-only | data | loose | unmanaged
+  --json                 NDJSON output (machine-readable)
+
+adopt OPTIONS
+  [name]                 Adopt one specific entry; skip the walk
+  --only-category <c>    Walk only one category
+  --dry-run              Walk + prompt; don't write config or push
+  --revert               Restore config.json from most recent backup
 
 data SUBCOMMANDS
   status [project]       Show data surfaces: linked, mounted, cached, missing, stale
@@ -207,12 +220,12 @@ discover_sshglob() {
   local src_json="$1"
   local sname=$(jq -r '.name' <<<"$src_json")
   local host=$(jq -r '.host' <<<"$src_json")
-  local path=$(jq -r '.path' <<<"$src_json")
+  local src_path=$(jq -r '.path' <<<"$src_json")
   local glob=$(jq -r '.glob // "*.git"' <<<"$src_json")
 
   [[ -z "$host" || "$host" == "null" ]] && { err "ssh-glob source '$sname' missing 'host'"; return 1; }
 
-  ssh -o BatchMode=yes "$host" "ls -1d '$path'/${glob} 2>/dev/null" 2>/dev/null \
+  ssh -o BatchMode=yes "$host" "ls -1d '$src_path'/${glob} 2>/dev/null" 2>/dev/null \
     | while IFS= read -r remote_dir; do
         [[ -z "$remote_dir" ]] && continue
         local base="${remote_dir##*/}"
@@ -280,8 +293,8 @@ source_pattern() {
       ;;
     ssh-glob)
       local host=$(jq -r '.host' <<<"$src_json")
-      local path=$(jq -r '.path' <<<"$src_json")
-      print -r -- "${host}:${path}"
+      local src_path=$(jq -r '.path' <<<"$src_json")
+      print -r -- "${host}:${src_path}"
       ;;
     *)
       print -r -- ""
@@ -328,6 +341,196 @@ resolve_fetch_args() {
 
 project_post_clone() {
   cfg_project_get "$1" | jq -r '.post_clone // [] | .[]'
+}
+
+# ─── workspace classification (for audit / adopt) ──────────────────────────
+# Categorizes each top-level entry under $target into one of:
+#   managed     — git repo whose origin matches a configured source pattern
+#                 AND project.skip is not true
+#   skipped     — projects.<name>.skip = true in config
+#   third-party — git repo with origin set, but no source pattern matches
+#   local-only  — git repo, no origin remote
+#   data        — directory, no .git
+#   loose       — regular file at workspace root
+# Hidden entries (starting with .) are skipped silently.
+#
+# Emits NDJSON. Each line:
+#   {name, category, path, size_bytes, origin?, last_commit_ts?, suggestion?}
+_classify_workspace() {
+  local target=$(cfg_target)
+  [[ -d "$target" ]] || return 0
+
+  local d name origin sname proj_skip size_bytes last_ct suggestion category
+
+  for d in "$target"/*(N) "$target"/.*(N); do
+    name="${d##*/}"
+    # skip hidden, ., ..
+    case "$name" in .|..|.DS_Store|.ws.log|.attic) continue ;; .*) continue ;; esac
+
+    size_bytes=$(du -sk "$d" 2>/dev/null | cut -f1)
+    [[ -z "$size_bytes" ]] && size_bytes=0
+    size_bytes=$((size_bytes * 1024))
+
+    if [[ -f "$d" ]]; then
+      category="loose"
+      suggestion=$(_suggest_loose "$d" "$size_bytes")
+      jq -nc --arg n "$name" --arg c "$category" --arg p "$d" \
+             --argjson sb "$size_bytes" --arg s "$suggestion" \
+        '{name:$n, category:$c, path:$p, size_bytes:$sb, suggestion:$s}'
+      continue
+    fi
+
+    if project_is_skipped "$name"; then
+      jq -nc --arg n "$name" --arg c "skipped" --arg p "$d" --argjson sb "$size_bytes" \
+        '{name:$n, category:$c, path:$p, size_bytes:$sb}'
+      continue
+    fi
+
+    if [[ -d "$d/.git" || -f "$d/.git" ]]; then
+      origin=$(git -C "$d" remote get-url origin 2>/dev/null || true)
+      last_ct=$(git -C "$d" log -1 --format=%ct 2>/dev/null || echo 0)
+      if [[ -z "$origin" ]]; then
+        category="local-only"
+        suggestion="push to github or homelab"
+      else
+        sname=$(match_source_by_url "$origin")
+        if [[ -n "$sname" ]]; then
+          category="managed"
+          suggestion="source: $sname"
+        else
+          category="third-party"
+          suggestion="leave alone (or add owner as a source)"
+        fi
+      fi
+      jq -nc --arg n "$name" --arg c "$category" --arg p "$d" \
+             --argjson sb "$size_bytes" --arg o "${origin:-}" \
+             --argjson lct "$last_ct" --arg s "$suggestion" \
+        '{name:$n, category:$c, path:$p, size_bytes:$sb, origin:$o, last_commit_ts:$lct, suggestion:$s}'
+    else
+      category="data"
+      suggestion=$(_suggest_data "$name" "$size_bytes")
+      jq -nc --arg n "$name" --arg c "$category" --arg p "$d" \
+             --argjson sb "$size_bytes" --arg s "$suggestion" \
+        '{name:$n, category:$c, path:$p, size_bytes:$sb, suggestion:$s}'
+    fi
+  done
+}
+
+_suggest_data() {
+  local name="$1" size_bytes="$2"
+  local rsync_src=$(cfg_data_sources | jq -rs 'map(select(.type=="rsync-glob")) | .[0].name // empty')
+  if [[ -n "$rsync_src" ]]; then
+    print -r -- "rsync data surface (source: $rsync_src)"
+  else
+    print -r -- "leave alone (or configure a data_source)"
+  fi
+}
+
+_suggest_loose() {
+  local entry_path="$1" size_bytes="$2"
+  if [[ "$size_bytes" -gt $((100 * 1024 * 1024)) ]]; then
+    print -r -- "large file — consider archiving"
+  else
+    print -r -- "leave alone"
+  fi
+}
+
+_humanize_bytes() {
+  local b="$1"
+  if   [[ $b -ge 1073741824 ]]; then awk -v b="$b" 'BEGIN{printf "%.1fG", b/1073741824}'
+  elif [[ $b -ge 1048576 ]];    then awk -v b="$b" 'BEGIN{printf "%.0fM", b/1048576}'
+  elif [[ $b -ge 1024 ]];       then awk -v b="$b" 'BEGIN{printf "%.0fK", b/1024}'
+  else                                printf '%dB' "$b"
+  fi
+}
+
+# ─── config mutators (with one-time backup per session) ────────────────────
+# Single backup file per ws-adopt session — recorded in WS_CFG_BACKUP env var
+# so all mutators in the same session share it (and revert undoes the lot).
+_cfg_backup_once() {
+  if [[ -z "${WS_CFG_BACKUP:-}" ]]; then
+    local stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    WS_CFG_BACKUP="$CONFIG.bak-$stamp"
+    cp "$CONFIG" "$WS_CFG_BACKUP" || die "failed to write backup at $WS_CFG_BACKUP"
+    export WS_CFG_BACKUP
+  fi
+}
+
+_cfg_write() {
+  local new_json="$1"
+  local tmp=$(mktemp)
+  print -r -- "$new_json" | jq . > "$tmp" 2>/dev/null \
+    || { rm -f "$tmp"; die "jq rejected config write (would-be content malformed)"; }
+  mv "$tmp" "$CONFIG"
+}
+
+# Set projects.<name>.skip = true
+_cfg_set_project_skip() {
+  local name="$1"
+  _cfg_backup_once
+  local cur=$(cat "$CONFIG")
+  local new=$(jq --arg n "$name" '.projects = ((.projects // {}) | .[$n] = ((.[$n] // {}) | .skip = true))' <<<"$cur")
+  _cfg_write "$new"
+}
+
+# Add a github-list source. Args: source_name, owner
+_cfg_add_github_source() {
+  local sname="$1" owner="$2"
+  _cfg_backup_once
+  local cur=$(cat "$CONFIG")
+  local new=$(jq --arg n "$sname" --arg o "$owner" '
+    .sources = ((.sources // []) + [{
+      name: $n, type: "github-list", owner: $o,
+      skip_archived: true, skip_forks: false,
+      clone_args: ["--filter=blob:limit=1m"],
+      fetch_args: ["--prune", "--tags"],
+      create: { enabled: false }
+    }])' <<<"$cur")
+  _cfg_write "$new"
+}
+
+# Add a rsync data surface to a project.
+# Args: name, source, remote, local, direction
+_cfg_add_data_rsync() {
+  local name="$1" source="$2" remote="$3" local_path="$4" direction="$5"
+  _cfg_backup_once
+  local cur=$(cat "$CONFIG")
+  local new=$(jq --arg n "$name" --arg s "$source" --arg r "$remote" --arg l "$local_path" --arg dir "$direction" '
+    .projects = ((.projects // {}) | .[$n] = ((.[$n] // {}) | .data = ((.data // []) + [{
+      path: ".", mode: "rsync", source: $s, remote: $r, local: $l, direction: $dir
+    }])))' <<<"$cur")
+  _cfg_write "$new"
+}
+
+# Add a mount-link data surface to a project.
+# Args: name, source, local_path
+_cfg_add_data_link() {
+  local name="$1" source="$2" local_path="$3"
+  _cfg_backup_once
+  local cur=$(cat "$CONFIG")
+  local new=$(jq --arg n "$name" --arg s "$source" --arg l "$local_path" '
+    .projects = ((.projects // {}) | .[$n] = ((.[$n] // {}) | .data = ((.data // []) + [{
+      path: ".", mode: "link", source: $s, local: $l
+    }])))' <<<"$cur")
+  _cfg_write "$new"
+}
+
+# Append to ~/.config/ws/.ignore (newline-delimited list of loose-file names)
+_cfg_loose_ignore() {
+  local name="$1"
+  local ignore_file="$WS_HOME/.ignore"
+  touch "$ignore_file"
+  grep -qxF -- "$name" "$ignore_file" 2>/dev/null || print -r -- "$name" >> "$ignore_file"
+}
+
+# Find most recent config.json.bak-* and restore it
+_cfg_revert() {
+  # (N) qualifier = null-glob just for this expansion; (Om) sorts by mtime desc
+  local -a backups=("$CONFIG".bak-*(NOm))
+  [[ ${#backups[@]} -eq 0 ]] && die "no config backup to revert from"
+  local latest="${backups[1]}"
+  cp "$latest" "$CONFIG" || die "revert failed"
+  ok "reverted $CONFIG from $latest"
 }
 
 # ─── pwd auto-scope ────────────────────────────────────────────────────────
@@ -848,42 +1051,49 @@ cmd_new() {
 
   # remote setup
   case "$remote" in
-    github)
-      require_cmd gh
-      local src=$(cfg_source_by_name "github" 2>/dev/null || cfg_source_by_name "$(cfg_default new_remote)" 2>/dev/null)
-      local owner=$(jq -r '.owner // empty' <<<"$src" 2>/dev/null)
-      [[ -z "$owner" ]] && owner="$(gh api user --jq .login 2>/dev/null)"
-      local -a gh_args=("${(@f)$(jq -r '.create.gh_args // [] | .[]' <<<"$src")}")
-      [[ ${#gh_args[@]} -eq 1 && -z "${gh_args[1]}" ]] && gh_args=()
-      # default to private unless --public; existing config may already include --private
-      if [[ "$public" == "1" ]]; then
-        gh_args=(${gh_args[@]:#--private})
-        gh_args+=(--public)
-      fi
-      [[ -n "$description" ]] && gh_args+=(--description "$description")
-      info "running: gh repo create ${owner}/${name} ${gh_args[*]} --source=. --push"
-      (cd "$dir" && gh repo create "${owner}/${name}" "${gh_args[@]}" --source=. --push) \
-        || die "gh repo create failed"
-      ok "created github.com/${owner}/${name} and pushed initial commit"
-      ;;
-    homelab)
-      local src=$(cfg_source_by_name "homelab" 2>/dev/null)
-      [[ -z "$src" ]] && die "no 'homelab' source in config; can't create homelab remote"
-      local host=$(jq -r '.host' <<<"$src")
-      local rpath=$(jq -r '.path' <<<"$src")
-      local url="${host}:${rpath}/${name}.git"
-      info "ssh $host: git init --bare $rpath/${name}.git"
-      ssh "$host" "git init --bare $rpath/${name}.git" >/dev/null || die "homelab bare init failed"
-      git -C "$dir" remote add origin "$url"
-      git -C "$dir" push -u origin "$branch" || warn "initial push failed (you can retry: cd $dir && git push -u origin $branch)"
-      ok "created $url and pushed initial commit"
-      ;;
-    none)
-      info "skipping remote setup (local-only repo)"
-      ;;
+    github)  _remote_setup_github "$name" "$dir" "$public" "$description" ;;
+    homelab) _remote_setup_homelab "$name" "$dir" "$branch" ;;
+    none)    info "skipping remote setup (local-only repo)" ;;
   esac
 
   print -r -- "$dir"
+}
+
+# ─── remote setup helpers (used by cmd_new and cmd_adopt) ──────────────────
+_remote_setup_github() {
+  local name="$1" dir="$2" public="$3" description="$4"
+  require_cmd gh
+  local src=$(cfg_source_by_name "github" 2>/dev/null || cfg_source_by_name "$(cfg_default new_remote)" 2>/dev/null)
+  local owner=$(jq -r '.owner // empty' <<<"$src" 2>/dev/null)
+  [[ -z "$owner" ]] && owner="$(gh api user --jq .login 2>/dev/null)"
+  local -a gh_args=("${(@f)$(jq -r '.create.gh_args // [] | .[]' <<<"$src")}")
+  [[ ${#gh_args[@]} -eq 1 && -z "${gh_args[1]}" ]] && gh_args=()
+  if [[ "$public" == "1" ]]; then
+    gh_args=(${gh_args[@]:#--private})
+    gh_args+=(--public)
+  fi
+  [[ -n "$description" ]] && gh_args+=(--description "$description")
+  info "running: gh repo create ${owner}/${name} ${gh_args[*]} --source=. --push"
+  (cd "$dir" && gh repo create "${owner}/${name}" "${gh_args[@]}" --source=. --push) \
+    || { err "gh repo create failed"; return 1; }
+  ok "created github.com/${owner}/${name} and pushed initial commit"
+}
+
+_remote_setup_homelab() {
+  local name="$1" dir="$2" branch="$3"
+  local src=$(cfg_source_by_name "homelab" 2>/dev/null)
+  [[ -z "$src" ]] && { err "no 'homelab' source in config; can't create homelab remote"; return 1; }
+  local host=$(jq -r '.host' <<<"$src")
+  local rpath=$(jq -r '.path' <<<"$src")
+  local url="${host}:${rpath}/${name}.git"
+  info "ssh $host: git init --bare $rpath/${name}.git"
+  ssh "$host" "git init --bare $rpath/${name}.git" >/dev/null \
+    || { err "homelab bare init failed"; return 1; }
+  git -C "$dir" remote add origin "$url" 2>/dev/null \
+    || git -C "$dir" remote set-url origin "$url"
+  git -C "$dir" push -u origin "$branch" \
+    || warn "initial push failed (you can retry: cd $dir && git push -u origin $branch)"
+  ok "created $url and pushed initial commit"
 }
 
 # ─── cmd: push ─────────────────────────────────────────────────────────────
@@ -1185,10 +1395,10 @@ cmd_init_remote() {
   local src=$(cfg_source_by_name "homelab")
   [[ -z "$src" ]] && die "no 'homelab' source in config"
   local host=$(jq -r '.host' <<<"$src")
-  local path=$(jq -r '.path' <<<"$src")
-  info "ssh $host: mkdir -p $path && git init --bare $path/${name}.git"
-  ssh "$host" "mkdir -p $path && cd $path && git init --bare ${name}.git" \
-    && ok "created ${host}:${path}/${name}.git"
+  local src_path=$(jq -r '.path' <<<"$src")
+  info "ssh $host: mkdir -p $src_path && git init --bare $src_path/${name}.git"
+  ssh "$host" "mkdir -p $src_path && cd $src_path && git init --bare ${name}.git" \
+    && ok "created ${host}:${src_path}/${name}.git"
 }
 
 # ─── cmd: reclone ──────────────────────────────────────────────────────────
@@ -1394,53 +1604,53 @@ cmd_data() {
 data_one() {
   local sub="$1" pname="$2" surface="$3" dry="$4" delete="$5" itemize="$6"
   local target=$(cfg_target)
-  local path=$(jq -r '.path' <<<"$surface")
+  local surface_path=$(jq -r '.path' <<<"$surface")
   local mode=$(jq -r '.mode' <<<"$surface")
   local source=$(jq -r '.source' <<<"$surface")
   local remote=$(jq -r '.remote // empty' <<<"$surface")
   local local_path=$(jq -r '.local // empty' <<<"$surface")
   local direction=$(jq -r '.direction // "pull-only"' <<<"$surface")
   local repo_dir="$target/$pname"
-  local link_path="$repo_dir/$path"
+  local link_path="$repo_dir/$surface_path"
 
   local ds=$(cfg_data_source_by_name "$source")
-  [[ -z "$ds" ]] && { err "$pname:$path references unknown data source '$source'"; return 1; }
+  [[ -z "$ds" ]] && { err "$pname:$surface_path references unknown data source '$source'"; return 1; }
   local ds_type=$(jq -r '.type' <<<"$ds")
 
   case "$mode" in
     link)
-      [[ "$ds_type" != "mount-link" ]] && warn "$pname:$path mode=link expects mount-link source (got $ds_type)"
+      [[ "$ds_type" != "mount-link" ]] && warn "$pname:$surface_path mode=link expects mount-link source (got $ds_type)"
       local mount_root=$(jq -r '.mount_root // empty' <<<"$ds")
       local resolved_local=$(expand_path "$local_path")
 
       case "$sub" in
         status|plan)
           if [[ ! -d "$mount_root" ]]; then
-            print -r -- "  ${C_Y}$pname:$path${C_0}  link  mount missing ($mount_root)"
+            print -r -- "  ${C_Y}$pname:$surface_path${C_0}  link  mount missing ($mount_root)"
           elif [[ ! -e "$resolved_local" ]]; then
-            print -r -- "  ${C_Y}$pname:$path${C_0}  link  source missing ($resolved_local)"
+            print -r -- "  ${C_Y}$pname:$surface_path${C_0}  link  source missing ($resolved_local)"
           elif [[ -L "$link_path" && "$(readlink "$link_path")" == "$resolved_local" ]]; then
-            print -r -- "  ${C_G}$pname:$path${C_0}  link  ok -> $resolved_local"
+            print -r -- "  ${C_G}$pname:$surface_path${C_0}  link  ok -> $resolved_local"
           elif [[ -e "$link_path" ]]; then
-            print -r -- "  ${C_R}$pname:$path${C_0}  link  conflicting non-link exists at $link_path"
+            print -r -- "  ${C_R}$pname:$surface_path${C_0}  link  conflicting non-link exists at $link_path"
           else
-            print -r -- "  ${C_Y}$pname:$path${C_0}  link  needs creation -> $resolved_local"
+            print -r -- "  ${C_Y}$pname:$surface_path${C_0}  link  needs creation -> $resolved_local"
           fi
           ;;
         link)
           if [[ ! -d "$mount_root" ]]; then
-            warn "$pname:$path mount missing: $mount_root — skipping"
+            warn "$pname:$surface_path mount missing: $mount_root — skipping"
             return 0
           fi
           if [[ ! -e "$resolved_local" ]]; then
-            warn "$pname:$path source missing: $resolved_local — skipping"
+            warn "$pname:$surface_path source missing: $resolved_local — skipping"
             return 0
           fi
           if [[ -L "$link_path" && "$(readlink "$link_path")" == "$resolved_local" ]]; then
             return 0
           fi
           if [[ -e "$link_path" && ! -L "$link_path" ]]; then
-            err "$pname:$path refusing to overwrite existing directory at $link_path"
+            err "$pname:$surface_path refusing to overwrite existing directory at $link_path"
             return 1
           fi
           if [[ "$dry" == "1" ]]; then
@@ -1452,13 +1662,13 @@ data_one() {
           ok "linked $link_path -> $resolved_local"
           ;;
         pull|push)
-          warn "$pname:$path mode=link does not support $sub; use ws data link"
+          warn "$pname:$surface_path mode=link does not support $sub; use ws data link"
           ;;
       esac
       ;;
 
     rsync)
-      [[ "$ds_type" != "rsync-glob" ]] && warn "$pname:$path mode=rsync expects rsync-glob source (got $ds_type)"
+      [[ "$ds_type" != "rsync-glob" ]] && warn "$pname:$surface_path mode=rsync expects rsync-glob source (got $ds_type)"
       local host=$(jq -r '.host' <<<"$ds")
       local remote_path=$(jq -r '.remote_path' <<<"$ds")
       local -a rsync_args=("${(@f)$(jq -r '.rsync_args // ["-a","--partial"] | .[]' <<<"$ds")}")
@@ -1480,7 +1690,7 @@ data_one() {
             [[ "$direction" == "push-explicit" ]] && \
               print -r -- "    push: rsync ${rsync_args[*]} ${excludes[*]} ${resolved_local}/ ${resolved_remote}"
           else
-            print -r -- "  ${C_G}$pname:$path${C_0}  rsync  $existsmark  (direction=$direction)"
+            print -r -- "  ${C_G}$pname:$surface_path${C_0}  rsync  $existsmark  (direction=$direction)"
           fi
           ;;
         pull)
@@ -1490,16 +1700,16 @@ data_one() {
           [[ "$dry" == "1" ]] && final_args+=(--dry-run)
           info "rsync ${final_args[*]} ${resolved_remote} ${resolved_local}/"
           rsync "${final_args[@]}" "$resolved_remote" "$resolved_local/" \
-            || { err "$pname:$path rsync pull failed"; return 1; }
+            || { err "$pname:$surface_path rsync pull failed"; return 1; }
           ;;
         push)
-          [[ "$direction" != "push-explicit" ]] && { err "$pname:$path push not allowed (direction=$direction)"; return 1; }
+          [[ "$direction" != "push-explicit" ]] && { err "$pname:$surface_path push not allowed (direction=$direction)"; return 1; }
           local -a final_args=("${rsync_args[@]}" "${excludes[@]}")
           [[ "$delete" == "1" ]] && final_args+=(--delete)
           # always dry-run first
           info "DRY: rsync ${final_args[*]} --dry-run ${resolved_local}/ ${resolved_remote}"
           rsync "${final_args[@]}" --dry-run "$resolved_local/" "$resolved_remote" \
-            || { err "$pname:$path rsync dry push failed"; return 1; }
+            || { err "$pname:$surface_path rsync dry push failed"; return 1; }
           if [[ "$dry" == "1" ]]; then
             return 0
           fi
@@ -1507,14 +1717,574 @@ data_one() {
           read -k 1 ans; print -r -- ""
           [[ "$ans" != "y" && "$ans" != "Y" ]] && { info "aborted"; return 0; }
           rsync "${final_args[@]}" "$resolved_local/" "$resolved_remote" \
-            || { err "$pname:$path rsync push failed"; return 1; }
+            || { err "$pname:$surface_path rsync push failed"; return 1; }
           ;;
         link)
-          warn "$pname:$path mode=rsync does not support link; use mode=link with mount-link source"
+          warn "$pname:$surface_path mode=rsync does not support link; use mode=link with mount-link source"
           ;;
       esac
       ;;
   esac
+}
+
+# ─── cmd: audit ────────────────────────────────────────────────────────────
+cmd_audit() {
+  local source_filter="" category_filter="" json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --source)   source_filter="$2"; shift 2 ;;
+      --category) category_filter="$2"; shift 2 ;;
+      --json)     json=1; shift ;;
+      -h|--help)  print -r -- "Usage: ws audit [--source <name>] [--category <c>] [--json]"; return 0 ;;
+      *) die "ws audit: unknown flag '$1'" ;;
+    esac
+  done
+
+  require_config
+
+  # Stream classification into NDJSON, applying filters.
+  local classified
+  classified=$(_classify_workspace | (
+    if [[ "$category_filter" == "unmanaged" ]]; then
+      jq -c 'select(.category != "managed" and .category != "skipped")'
+    elif [[ -n "$category_filter" ]]; then
+      jq -c --arg c "$category_filter" 'select(.category == $c)'
+    else
+      cat
+    fi
+  ))
+
+  if [[ -n "$source_filter" ]]; then
+    local src=$(cfg_source_by_name "$source_filter")
+    [[ -z "$src" ]] && die "no source named '$source_filter'"
+    local pat=$(source_pattern "$src")
+    classified=$(print -r -- "$classified" | jq -c --arg pat "$pat" '
+      select(.origin != null and (.origin | test($pat)))')
+  fi
+
+  if [[ "$json" == "1" ]]; then
+    print -r -- "$classified"
+    return 0
+  fi
+
+  # Grouped table output
+  local -a cats; cats=(managed skipped third-party local-only data loose)
+  local cat n entries label total_bytes
+  for cat in "${cats[@]}"; do
+    entries=$(print -r -- "$classified" | jq -c --arg c "$cat" 'select(.category == $c)' 2>/dev/null)
+    [[ -z "$entries" ]] && continue
+    n=$(print -r -- "$entries" | wc -l | tr -d ' ')
+    total_bytes=$(print -r -- "$entries" | jq -s 'map(.size_bytes) | add // 0')
+
+    case "$cat" in
+      managed)     label="Managed (${n})" ;;
+      skipped)     label="Skipped via config (${n})" ;;
+      third-party) label="Third-party git repos (${n})" ;;
+      local-only)  label="Local-only git repos (${n})" ;;
+      data)        label="Data directories (${n}, $(_humanize_bytes "$total_bytes") total)" ;;
+      loose)       label="Loose files at root (${n})" ;;
+    esac
+    print -r -- ""
+    print -r -- "${C_B}${label}${C_0}"
+
+    case "$cat" in
+      managed|skipped)
+        # compact list of names
+        local names
+        names=$(print -r -- "$entries" | jq -r '.name' | paste -sd', ' -)
+        print -r -- "  ${C_D}${names}${C_0}"
+        ;;
+      third-party)
+        {
+          printf '%s\t%s\t%s\n' NAME ORIGIN SIZE
+          print -r -- "$entries" | jq -r '"\(.name)\t\(.origin)\t\(.size_bytes)"' \
+            | while IFS=$'\t' read -r nm orig sz; do
+                printf '%s\t%s\t%s\n' "$nm" "$orig" "$(_humanize_bytes "$sz")"
+              done
+        } | column -t -s $'\t' | sed 's/^/  /'
+        ;;
+      local-only)
+        {
+          printf '%s\t%s\t%s\n' NAME SIZE SUGGESTION
+          print -r -- "$entries" | jq -r '"\(.name)\t\(.size_bytes)\t\(.suggestion // "-")"' \
+            | while IFS=$'\t' read -r nm sz sug; do
+                printf '%s\t%s\t%s\n' "$nm" "$(_humanize_bytes "$sz")" "$sug"
+              done
+        } | column -t -s $'\t' | sed 's/^/  /'
+        ;;
+      data)
+        {
+          printf '%s\t%s\t%s\n' NAME SIZE SUGGESTION
+          print -r -- "$entries" | jq -r '"\(.name)\t\(.size_bytes)\t\(.suggestion // "-")"' \
+            | sort -t $'\t' -k2 -rn \
+            | while IFS=$'\t' read -r nm sz sug; do
+                printf '%s\t%s\t%s\n' "$nm" "$(_humanize_bytes "$sz")" "$sug"
+              done
+        } | column -t -s $'\t' | sed 's/^/  /'
+        ;;
+      loose)
+        {
+          printf '%s\t%s\t%s\n' NAME SIZE SUGGESTION
+          print -r -- "$entries" | jq -r '"\(.name)\t\(.size_bytes)\t\(.suggestion // "-")"' \
+            | while IFS=$'\t' read -r nm sz sug; do
+                printf '%s\t%s\t%s\n' "$nm" "$(_humanize_bytes "$sz")" "$sug"
+              done
+        } | column -t -s $'\t' | sed 's/^/  /'
+        ;;
+    esac
+  done
+  print -r -- ""
+}
+
+# ─── adopt: per-shape prompts ──────────────────────────────────────────────
+# Each prompt function:
+#   - reads one entry from $1 (NDJSON)
+#   - uses globals _WS_ADOPT_APPLY_<CATEGORY> for "A" memos
+#   - prints decision summary line to $WS_ADOPT_LOG (file path in env)
+#   - returns: 0 normal, 1 quit, 2 skip-for-now (no config write)
+
+_adopt_log() { print -r -- "$1" >> "$WS_ADOPT_LOG"; }
+
+# Read a single-key answer. Falls back to line-based read when stdin isn't
+# a tty (for testing with piped input). Prompts go to stderr so $(…) capture
+# returns ONLY the answer.
+_adopt_read_key() {
+  local prompt="${1:->}" ans
+  print -nru 2 -- "$prompt "
+  if [[ -t 0 ]]; then
+    read -k 1 ans
+    print -ru 2 -- ""
+  else
+    read -r ans || ans=""
+    # take first non-space char (in case line was "1   " or "yes")
+    ans="${ans//[[:space:]]/}"
+    ans="${ans:0:1}"
+  fi
+  print -r -- "$ans"
+}
+
+_adopt_read_line() {
+  local prompt="$1" default="${2:-}" ans
+  if [[ -n "$default" ]]; then
+    print -nru 2 -- "$prompt [$default] "
+  else
+    print -nru 2 -- "$prompt "
+  fi
+  read -r ans || ans=""
+  [[ -z "$ans" ]] && ans="$default"
+  print -r -- "$ans"
+}
+
+# Universal handler for s/A/q. Sets ans + apply_to_all in caller via output.
+# Returns:
+#   echo digit → use this answer for current entry
+#   echo "s"   → skip for now
+#   echo "q"   → quit
+#   echo "A:N" → apply digit N to current and remaining (caller sets memo)
+
+_prompt_thirdparty() {
+  local entry="$1"
+  local name=$(jq -r '.name' <<<"$entry")
+  local origin=$(jq -r '.origin' <<<"$entry")
+  local size_bytes=$(jq -r '.size_bytes' <<<"$entry")
+  local last_ct=$(jq -r '.last_commit_ts' <<<"$entry")
+  local last_date="-"
+  [[ "$last_ct" -gt 0 ]] && last_date=$(date -r "$last_ct" '+%Y-%m-%d' 2>/dev/null || echo "-")
+
+  # apply-all memo for this category
+  local memo="${_WS_ADOPT_APPLY_THIRDPARTY:-}"
+
+  local ans
+  if [[ -n "$memo" ]]; then
+    ans="$memo"
+    info "[auto-applied: $memo] $name"
+  else
+    print -r -- ""
+    print -r -- "${C_B}$name${C_0} (third-party git)"
+    print -r -- "  origin:      $origin"
+    print -r -- "  size:        $(_humanize_bytes "$size_bytes")  last commit: $last_date"
+    print -r -- ""
+    print -r -- "  1) leave alone (invisible to ws — no config change)   [default]"
+    print -r -- "  2) add owner as a new github-list source"
+    print -r -- "  3) mark skip (projects.$name.skip = true)"
+    print -r -- "  s/A/q"
+
+    ans=$(_adopt_read_key ">")
+    [[ -z "$ans" ]] && ans=1
+  fi
+
+  case "$ans" in
+    1)  _adopt_log "leave: $name (third-party)"; return 0 ;;
+    2)
+      # Parse owner from origin: git@github.com:OWNER/repo[.git] or https://github.com/OWNER/repo
+      local owner=$(print -r -- "$origin" | sed -E 's|^git@github\.com:||; s|^https?://github\.com/||; s|/.*$||')
+      [[ -z "$owner" ]] && { warn "couldn't parse owner from $origin"; return 0; }
+      local sname=$(_adopt_read_line "  source name?" "$owner")
+      _cfg_add_github_source "$sname" "$owner"
+      _adopt_log "source-added: $sname (owner=$owner) [triggered by $name]"
+      ok "added source '$sname' for github.com/$owner/*"
+      return 0
+      ;;
+    3)  _cfg_set_project_skip "$name"; _adopt_log "skip: $name (third-party)"; return 0 ;;
+    s|S)
+      _adopt_log "defer: $name (third-party)"
+      return 2
+      ;;
+    A)
+      local sub=$(_adopt_read_key "  apply which answer (1-3) to remaining third-party?")
+      case "$sub" in
+        1|2|3) _WS_ADOPT_APPLY_THIRDPARTY="$sub"; export _WS_ADOPT_APPLY_THIRDPARTY
+               # re-invoke with the apply-all memo set
+               _prompt_thirdparty "$entry" ;;
+        *) warn "invalid; treating as skip-for-now"; return 2 ;;
+      esac
+      ;;
+    q|Q) return 1 ;;
+    *) warn "invalid choice '$ans'; treating as skip-for-now"; return 2 ;;
+  esac
+}
+
+_prompt_localonly() {
+  local entry="$1"
+  local name=$(jq -r '.name' <<<"$entry")
+  local dir=$(jq -r '.path' <<<"$entry")
+  local size_bytes=$(jq -r '.size_bytes' <<<"$entry")
+  local commits=$(git -C "$dir" rev-list --count HEAD 2>/dev/null || echo 0)
+  local branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+
+  local memo="${_WS_ADOPT_APPLY_LOCALONLY:-}"
+  local ans
+  if [[ -n "$memo" ]]; then
+    ans="$memo"
+    info "[auto-applied: $memo] $name"
+  else
+    print -r -- ""
+    print -r -- "${C_B}$name${C_0} (local-only git)"
+    print -r -- "  size:        $(_humanize_bytes "$size_bytes")  $commits commits on $branch"
+    print -r -- ""
+    print -r -- "  1) leave alone                                       [default]"
+    print -r -- "  2) push to github (private, kendreaditya/$name)"
+    print -r -- "  3) push to homelab (via 'homelab' source)"
+    print -r -- "  4) mark skip"
+    print -r -- "  s/A/q"
+
+    ans=$(_adopt_read_key ">")
+    [[ -z "$ans" ]] && ans=1
+  fi
+
+  case "$ans" in
+    1)  _adopt_log "leave: $name (local-only)"; return 0 ;;
+    2)
+      if _remote_setup_github "$name" "$dir" "0" ""; then
+        _adopt_log "pushed-to-github: $name"
+      else
+        _adopt_log "FAILED push-to-github: $name"
+      fi
+      return 0
+      ;;
+    3)
+      if _remote_setup_homelab "$name" "$dir" "$branch"; then
+        _adopt_log "pushed-to-homelab: $name"
+      else
+        _adopt_log "FAILED push-to-homelab: $name"
+      fi
+      return 0
+      ;;
+    4)  _cfg_set_project_skip "$name"; _adopt_log "skip: $name (local-only)"; return 0 ;;
+    s|S) _adopt_log "defer: $name (local-only)"; return 2 ;;
+    A)
+      local sub=$(_adopt_read_key "  apply which answer (1-4) to remaining local-only?")
+      case "$sub" in
+        1|2|3|4) _WS_ADOPT_APPLY_LOCALONLY="$sub"; export _WS_ADOPT_APPLY_LOCALONLY
+                 _prompt_localonly "$entry" ;;
+        *) warn "invalid; treating as skip-for-now"; return 2 ;;
+      esac
+      ;;
+    q|Q) return 1 ;;
+    *) warn "invalid choice '$ans'; treating as skip-for-now"; return 2 ;;
+  esac
+}
+
+_prompt_data() {
+  local entry="$1"
+  local name=$(jq -r '.name' <<<"$entry")
+  local size_bytes=$(jq -r '.size_bytes' <<<"$entry")
+
+  local rsync_src=$(cfg_data_sources | jq -rs 'map(select(.type=="rsync-glob")) | .[0].name // empty')
+  local mount_src=$(cfg_data_sources | jq -rs 'map(select(.type=="mount-link")) | .[0].name // empty')
+
+  local memo="${_WS_ADOPT_APPLY_DATA:-}"
+  local ans
+  if [[ -n "$memo" ]]; then
+    ans="$memo"
+    info "[auto-applied: $memo] $name"
+  else
+    print -r -- ""
+    print -r -- "${C_B}$name${C_0} (data dir, no .git)"
+    print -r -- "  size:        $(_humanize_bytes "$size_bytes")"
+    print -r -- ""
+    print -r -- "  1) leave alone                                       [default]"
+    if [[ -n "$rsync_src" ]]; then
+      print -r -- "  2) configure as rsync data surface (source: $rsync_src)"
+    else
+      print -r -- "  2) configure as rsync data surface ${C_D}[no rsync-glob source in config]${C_0}"
+    fi
+    if [[ -n "$mount_src" ]]; then
+      print -r -- "  3) configure as mount-link data surface (source: $mount_src)"
+    else
+      print -r -- "  3) configure as mount-link data surface ${C_D}[no mount-link source in config]${C_0}"
+    fi
+    print -r -- "  4) convert to git repo + push to github"
+    print -r -- "  5) convert to git repo + push to homelab"
+    print -r -- "  6) mark skip"
+    print -r -- "  s/A/q"
+
+    ans=$(_adopt_read_key ">")
+    [[ -z "$ans" ]] && ans=1
+  fi
+
+  case "$ans" in
+    1) _adopt_log "leave: $name (data)"; return 0 ;;
+    2)
+      [[ -z "$rsync_src" ]] && { warn "no rsync-glob data_source configured; cannot select"; return 2; }
+      local src=$(_adopt_read_line "  rsync source?" "$rsync_src")
+      local rem=$(_adopt_read_line "  remote path under source?" "$name")
+      local loc=$(_adopt_read_line "  local cache path?" "~/workspace-data/$name")
+      local dirn=$(_adopt_read_line "  direction (pull-only|push-explicit)?" "pull-only")
+      _cfg_add_data_rsync "$name" "$src" "$rem" "$loc" "$dirn"
+      _adopt_log "data-rsync: $name -> $src:$rem ($dirn)"
+      ok "configured rsync data surface for $name"
+      return 0
+      ;;
+    3)
+      [[ -z "$mount_src" ]] && { warn "no mount-link data_source configured; cannot select"; return 2; }
+      local src=$(_adopt_read_line "  mount-link source?" "$mount_src")
+      local mr=$(cfg_data_source_by_name "$src" | jq -r '.mount_root')
+      local loc=$(_adopt_read_line "  local mount path?" "$mr/$name")
+      _cfg_add_data_link "$name" "$src" "$loc"
+      _adopt_log "data-link: $name -> $loc"
+      ok "configured mount-link data surface for $name"
+      return 0
+      ;;
+    4)
+      local target=$(cfg_target)
+      local dir="$target/$name"
+      # ensure it's a git repo (init if needed)
+      [[ ! -d "$dir/.git" ]] && git -C "$dir" init -q -b main && git -C "$dir" add -A 2>/dev/null \
+        && git -C "$dir" -c user.useConfigOnly=false commit -q -m "init from ws adopt" 2>/dev/null
+      if _remote_setup_github "$name" "$dir" "0" ""; then
+        _adopt_log "data-to-github: $name"
+      else
+        _adopt_log "FAILED data-to-github: $name"
+      fi
+      return 0
+      ;;
+    5)
+      local target=$(cfg_target)
+      local dir="$target/$name"
+      [[ ! -d "$dir/.git" ]] && git -C "$dir" init -q -b main && git -C "$dir" add -A 2>/dev/null \
+        && git -C "$dir" -c user.useConfigOnly=false commit -q -m "init from ws adopt" 2>/dev/null
+      if _remote_setup_homelab "$name" "$dir" "main"; then
+        _adopt_log "data-to-homelab: $name"
+      else
+        _adopt_log "FAILED data-to-homelab: $name"
+      fi
+      return 0
+      ;;
+    6) _cfg_set_project_skip "$name"; _adopt_log "skip: $name (data)"; return 0 ;;
+    s|S) _adopt_log "defer: $name (data)"; return 2 ;;
+    A)
+      local sub=$(_adopt_read_key "  apply which answer (1-6) to remaining data?")
+      case "$sub" in
+        1|2|3|4|5|6) _WS_ADOPT_APPLY_DATA="$sub"; export _WS_ADOPT_APPLY_DATA
+                     _prompt_data "$entry" ;;
+        *) warn "invalid; treating as skip-for-now"; return 2 ;;
+      esac
+      ;;
+    q|Q) return 1 ;;
+    *) warn "invalid choice '$ans'; treating as skip-for-now"; return 2 ;;
+  esac
+}
+
+_prompt_loose() {
+  local entry="$1"
+  local name=$(jq -r '.name' <<<"$entry")
+  local entry_path=$(jq -r '.path' <<<"$entry")
+  local size_bytes=$(jq -r '.size_bytes' <<<"$entry")
+  local mtime=$(stat -f '%Sm' -t '%Y-%m-%d' "$entry_path" 2>/dev/null || stat -c '%y' "$entry_path" 2>/dev/null | cut -d' ' -f1)
+
+  local memo="${_WS_ADOPT_APPLY_LOOSE:-}"
+  local ans
+  if [[ -n "$memo" ]]; then
+    ans="$memo"
+    info "[auto-applied: $memo] $name"
+  else
+    print -r -- ""
+    print -r -- "${C_B}$name${C_0} (loose file)"
+    print -r -- "  size:        $(_humanize_bytes "$size_bytes")  mtime: $mtime"
+    print -r -- ""
+    print -r -- "  1) leave alone (ws ignores loose files anyway)       [default]"
+    print -r -- "  2) move into ~/workspace/_archive/"
+    print -r -- "  3) mark in .ignore (suppresses from audit)"
+    print -r -- "  s/A/q"
+
+    ans=$(_adopt_read_key ">")
+    [[ -z "$ans" ]] && ans=1
+  fi
+
+  case "$ans" in
+    1) _adopt_log "leave: $name (loose)"; return 0 ;;
+    2)
+      local target=$(cfg_target)
+      mkdir -p "$target/_archive"
+      mv "$entry_path" "$target/_archive/$name" \
+        && _adopt_log "moved: $name -> _archive/$name" \
+        || { _adopt_log "FAILED move: $name"; return 0; }
+      ok "moved $name to _archive/"
+      return 0
+      ;;
+    3) _cfg_loose_ignore "$name"; _adopt_log "ignored: $name (loose)"; return 0 ;;
+    s|S) _adopt_log "defer: $name (loose)"; return 2 ;;
+    A)
+      local sub=$(_adopt_read_key "  apply which answer (1-3) to remaining loose files?")
+      case "$sub" in
+        1|2|3) _WS_ADOPT_APPLY_LOOSE="$sub"; export _WS_ADOPT_APPLY_LOOSE
+               _prompt_loose "$entry" ;;
+        *) warn "invalid; treating as skip-for-now"; return 2 ;;
+      esac
+      ;;
+    q|Q) return 1 ;;
+    *) warn "invalid choice '$ans'; treating as skip-for-now"; return 2 ;;
+  esac
+}
+
+# ─── cmd: adopt ────────────────────────────────────────────────────────────
+cmd_adopt() {
+  local only_category="" dry_run=0 revert=0 single_name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --only-category) only_category="$2"; shift 2 ;;
+      --dry-run)       dry_run=1; shift ;;
+      --revert)        revert=1; shift ;;
+      -h|--help)       print -r -- "Usage: ws adopt [name] [--only-category <c>] [--dry-run] [--revert]"; return 0 ;;
+      -*)              die "ws adopt: unknown flag '$1'" ;;
+      *)               [[ -z "$single_name" ]] && single_name="$1" || die "ws adopt: extra arg '$1'"; shift ;;
+    esac
+  done
+
+  require_config
+
+  if [[ "$revert" == "1" ]]; then
+    _cfg_revert
+    return 0
+  fi
+
+  # Set up session log file
+  WS_ADOPT_LOG=$(mktemp -t ws-adopt.XXXXXX)
+  export WS_ADOPT_LOG
+
+  # In dry-run mode, intercept config writes
+  if [[ "$dry_run" == "1" ]]; then
+    # shadow the mutators with no-op + log
+    _cfg_set_project_skip() { _adopt_log "DRY: would set projects.$1.skip = true"; }
+    _cfg_add_github_source() { _adopt_log "DRY: would add source $1 (owner=$2)"; }
+    _cfg_add_data_rsync() { _adopt_log "DRY: would add rsync data surface for $1"; }
+    _cfg_add_data_link() { _adopt_log "DRY: would add mount-link data surface for $1"; }
+    _cfg_loose_ignore() { _adopt_log "DRY: would mark $1 in .ignore"; }
+    _remote_setup_github() { _adopt_log "DRY: would push $1 to github"; return 0; }
+    _remote_setup_homelab() { _adopt_log "DRY: would push $1 to homelab"; return 0; }
+  fi
+
+  # Build classified entry list (NDJSON)
+  local entries
+  entries=$(_classify_workspace | jq -c 'select(.category == "third-party" or .category == "local-only" or .category == "data" or .category == "loose")')
+
+  # Filter to single name if provided
+  if [[ -n "$single_name" ]]; then
+    entries=$(print -r -- "$entries" | jq -c --arg n "$single_name" 'select(.name == $n)')
+    [[ -z "$entries" ]] && die "no unmanaged entry named '$single_name' (already classified, or doesn't exist)"
+  fi
+
+  # Filter to one category
+  if [[ -n "$only_category" ]]; then
+    entries=$(print -r -- "$entries" | jq -c --arg c "$only_category" 'select(.category == $c)')
+  fi
+
+  if [[ -z "$entries" ]]; then
+    info "nothing to adopt — everything is classified or filter matched zero entries"
+    return 0
+  fi
+
+  # Show summary
+  local total=$(print -r -- "$entries" | wc -l | tr -d ' ')
+  if [[ -z "$single_name" ]]; then
+    print -r -- ""
+    print -r -- "${C_B}Found $total unmanaged entries:${C_0}"
+    local cat n
+    for cat in third-party local-only data loose; do
+      n=$(print -r -- "$entries" | jq -c --arg c "$cat" 'select(.category == $c)' | wc -l | tr -d ' ')
+      [[ "$n" -gt 0 ]] && print -r -- "  ▸ $n $cat"
+    done
+    print -r -- ""
+    local proceed=$(_adopt_read_key "Walk them now? [Y/n]")
+    case "$proceed" in n|N) info "cancelled"; rm -f "$WS_ADOPT_LOG"; return 0 ;; esac
+  fi
+
+  # Collect entries into an array BEFORE iterating — otherwise the while-read
+  # loop consumes stdin and the per-entry prompt reads see EOF.
+  local -a entry_array
+  while IFS= read -r entry; do
+    entry_array+=("$entry")
+  done <<<"$entries"
+
+  # The walk
+  local idx=0
+  local rc=0
+  for entry in "${entry_array[@]}"; do
+    idx=$((idx + 1))
+    local cat=$(jq -r '.category' <<<"$entry")
+    print -r -- ""
+    print -r -- "${C_D}── [$idx/$total] ──${C_0}"
+    case "$cat" in
+      third-party) _prompt_thirdparty "$entry" ;;
+      local-only)  _prompt_localonly  "$entry" ;;
+      data)        _prompt_data       "$entry" ;;
+      loose)       _prompt_loose      "$entry" ;;
+    esac
+    rc=$?
+    if [[ "$rc" == "1" ]]; then
+      info "quit requested — saving progress and exiting"
+      break
+    fi
+  done
+
+  # Summary
+  print -r -- ""
+  print -r -- "${C_B}Walk complete.${C_0}"
+  if [[ -s "$WS_ADOPT_LOG" ]]; then
+    local -A counts
+    while IFS= read -r line; do
+      local action="${line%%:*}"
+      counts[$action]=$((${counts[$action]:-0} + 1))
+    done < "$WS_ADOPT_LOG"
+    for k in ${(k)counts}; do
+      printf '  %-25s %d\n' "$k" "${counts[$k]}"
+    done
+  else
+    print -r -- "  (no actions)"
+  fi
+
+  if [[ "$dry_run" == "1" ]]; then
+    print -r -- ""
+    info "DRY-RUN: no config changes written."
+  elif [[ -n "${WS_CFG_BACKUP:-}" ]]; then
+    print -r -- ""
+    print -r -- "  Config:  $CONFIG"
+    print -r -- "  Backup:  $WS_CFG_BACKUP"
+    print -r -- "  Revert:  ws adopt --revert"
+  fi
+
+  rm -f "$WS_ADOPT_LOG"
 }
 
 # ─── dispatch ──────────────────────────────────────────────────────────────
@@ -1548,6 +2318,8 @@ main() {
     reclone)        cmd_reclone "$@" ;;
     explain)        cmd_explain "$@" ;;
     data)           cmd_data "$@" ;;
+    audit)          cmd_audit "$@" ;;
+    adopt)          cmd_adopt "$@" ;;
     *)              die "unknown command: $cmd (try 'ws --help')" ;;
   esac
 }

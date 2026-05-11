@@ -70,6 +70,52 @@ ws upgrade                         # git -C ~/.config/ws pull --ff-only
 ws --version                       # ws 0.1.0 (abc1234 2026-05-11)
 ```
 
+## Onboarding a pre-existing workspace
+
+If `~/workspace/` already has stuff in it (clones from another machine, data dirs, third-party reference repos, loose files), use these two commands:
+
+```bash
+ws audit                           # read-only classification dashboard
+ws adopt                           # interactive walk: classify each unmanaged entry
+```
+
+`ws audit` answers "what's in my workspace and how does ws see it?" — categorizes every top-level entry into one of:
+
+- **managed** — git repo whose origin URL matches a configured source
+- **third-party** — git repo with an origin that doesn't match any source (e.g. `SakanaAI/AI-Scientist`)
+- **local-only** — git repo with no remote
+- **data** — directory, no `.git`
+- **loose** — regular file at workspace root
+- **skipped** — name has `projects.<name>.skip = true` in config
+
+```bash
+ws audit                           # all categories, grouped table
+ws audit --category third-party    # just one bucket
+ws audit --category unmanaged      # everything that's not managed/skipped
+ws audit --json                    # NDJSON for piping to scripts
+```
+
+`ws adopt` walks every unmanaged entry one at a time, prompts you with shape-appropriate options, and writes your decisions to `config.json`. Each session creates a single timestamped backup at `config.json.bak-<ts>`.
+
+```bash
+ws adopt                           # interactive walk across all unmanaged
+ws adopt thirdparty-mock           # classify just one entry
+ws adopt --only-category data      # power through data dirs only
+ws adopt --dry-run                 # show prompts + intended writes, don't write
+ws adopt --revert                  # restore config.json from most recent backup
+```
+
+Per-shape prompt options:
+
+| Entry shape | Choices |
+|---|---|
+| third-party git repo | leave alone / add owner as a github-list source / mark skip |
+| local-only git repo | leave / push to github / push to homelab / mark skip |
+| data dir | leave / rsync surface / mount-link surface / git-init+push github / git-init+push homelab / mark skip |
+| loose file | leave / move to `_archive/` / mark in `.ignore` |
+
+Universal keys in every prompt: `s` = skip-for-now (reappears next run), `A` = apply the same answer to **all remaining items in this category** (great for 88 data dirs), `q` = quit walk, save progress, exit cleanly.
+
 ## Data surfaces
 
 For projects where the code is in git but the bulk data isn't:

@@ -1,6 +1,12 @@
 # user-specific config — only the example template is committed
 config.json
 
+# per-session config backups from `ws adopt`
+config.json.bak-*
+
+# loose-file ignore list (created by `ws adopt` answer 3 on loose files)
+.ignore
+
 # editors / OS noise
 .DS_Store
 *.swp
