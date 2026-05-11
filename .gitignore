@@ -1,0 +1,9 @@
+# user-specific config — only the example template is committed
+config.json
+
+# editors / OS noise
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/

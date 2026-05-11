@@ -1,0 +1,174 @@
+#compdef ws
+# zsh completion for ws
+# Source via: fpath=(~/.config/ws/completions $fpath); autoload -U compinit && compinit
+
+_ws() {
+  local -a commands
+  commands=(
+    'init:First-time setup (PATH symlink, config, templates, completion hint)'
+    'upgrade:Pull latest ws from upstream'
+    'sync:Clone new repos and fetch existing across all sources'
+    'data:Manage project data dirs (rsync caches + mount symlinks)'
+    'new:Create a new project (local + optional remote)'
+    'clone:Drop-in git clone that picks source/args by URL host'
+    'git:Run git command in every repo (or filtered subset)'
+    'status:Shortcut: ws git status -sb'
+    'list:Show all repos: source, args, remote, last fetch, dirty'
+    'cd:Print path of best-match repo'
+    'push:Bulk git push across dirty+ahead repos'
+    'pull:Bulk git pull --ff-only on clean+behind repos'
+    'prune:Per-source: list/remove repos deleted on remote'
+    'stale:List repos inactive >N days'
+    'size:Disk usage table per repo'
+    'init-remote:ssh into homelab and git init --bare'
+    'reclone:Re-clone a repo (backup, re-clone, confirm)'
+    'explain:Show resolved config for a repo'
+    'help:Show help'
+    'version:Show ws version'
+  )
+
+  local context curcontext="$curcontext" state line
+  typeset -A opt_args
+
+  _arguments -C \
+    '(- *)--version[show version]' \
+    '(- *)'{-h,--help}'[show help]' \
+    '--config[override config path]:config file:_files -g "*.json"' \
+    '1: :->cmds' \
+    '*::arg:->args'
+
+  case $state in
+    cmds)
+      _describe -t commands 'ws command' commands
+      ;;
+    args)
+      case $line[1] in
+        sync)
+          _arguments \
+            '--source[sync only this source]:source:_ws_sources' \
+            '--only[filter by repo name (glob)]:glob:' \
+            '--dry-run[print plan, do nothing]' \
+            '(-v --verbose)'{-v,--verbose}'[print resolved git command per repo]'
+          ;;
+        new)
+          _arguments \
+            '--remote[remote target]:remote:(github homelab none)' \
+            '--public[public repo (overrides config default)]' \
+            '--template[scaffold from template]:template:_ws_templates' \
+            '--description[for GitHub repo + README]:desc:' \
+            '--branch[initial branch]:branch:' \
+            '1:project name:'
+          ;;
+        clone)
+          _arguments '1:url:'
+          ;;
+        git)
+          _arguments \
+            '--source[limit to one source]:source:_ws_sources' \
+            '--only[glob filter]:glob:' \
+            '--all[force workspace-wide]' \
+            '--parallel[run N repos concurrently]:N:' \
+            '--fail-fast[stop on first nonzero exit]' \
+            '*::git args: _normal'
+          ;;
+        status|list)
+          _arguments \
+            '--source[limit to one source]:source:_ws_sources' \
+            '--only[glob filter]:glob:' \
+            '--all[force workspace-wide]'
+          ;;
+        cd|explain|reclone|init-remote)
+          _arguments '1:repo:_ws_repos'
+          ;;
+        push)
+          _arguments \
+            '--source[limit to one source]:source:_ws_sources' \
+            '--only[glob filter]:glob:' \
+            '--all[force workspace-wide]' \
+            '--dry-run[show what would push]'
+          ;;
+        pull)
+          _arguments \
+            '--safe[ff-only on clean+behind repos]' \
+            '--source[limit to one source]:source:_ws_sources' \
+            '--only[glob filter]:glob:'
+          ;;
+        prune)
+          _arguments \
+            '--source[required\: source to prune]:source:_ws_sources' \
+            '--only[glob filter]:glob:' \
+            '--commit[actually remove (default dry-run)]' \
+            '--archive[move to .attic instead of delete]'
+          ;;
+        stale)
+          _arguments \
+            '--days[threshold in days (default 60)]:N:' \
+            '--source[limit to one source]:source:_ws_sources' \
+            '--only[glob filter]:glob:'
+          ;;
+        data)
+          local -a data_subs
+          data_subs=(
+            'status:Show data surfaces'
+            'link:Create/repair symlinks'
+            'pull:Rsync server data into local cache'
+            'push:Rsync local cache to server (dry-run first)'
+            'plan:Print resolved actions without running'
+          )
+          if (( CURRENT == 2 )); then
+            _describe -t commands 'ws data subcommand' data_subs
+          else
+            _arguments \
+              '--dry-run[print plan, do nothing]' \
+              '--delete[allow rsync deletion (never default)]' \
+              '--itemize[pass --itemize-changes to rsync]' \
+              '*:project:_ws_repos'
+          fi
+          ;;
+      esac
+      ;;
+  esac
+}
+
+# Helpers that read live config
+
+_ws_sources() {
+  local cfg="${WS_CONFIG:-$HOME/.config/ws/config.json}"
+  [[ -f "$cfg" ]] || return
+  local -a names
+  names=(${(f)"$(jq -r '.sources[]?.name // empty' < "$cfg" 2>/dev/null)"})
+  _describe -t sources 'source' names
+}
+
+_ws_repos() {
+  local target="$HOME/workspace"
+  local cfg="${WS_CONFIG:-$HOME/.config/ws/config.json}"
+  if [[ -f "$cfg" ]] && command -v jq >/dev/null 2>&1; then
+    local t
+    t=$(jq -r '.target // "~/workspace"' < "$cfg" 2>/dev/null)
+    [[ "$t" == "~"* ]] && t="$HOME${t#~}"
+    [[ -n "$t" ]] && target="$t"
+  fi
+  [[ -d "$target" ]] || return
+  local -a names
+  names=()
+  local d
+  for d in "$target"/*(N/); do
+    names+=("${d:t}")
+  done
+  _describe -t repos 'repo' names
+}
+
+_ws_templates() {
+  local dir="$HOME/.config/ws/templates"
+  [[ -d "$dir" ]] || return
+  local -a names
+  names=()
+  local d
+  for d in "$dir"/*(N/); do
+    names+=("${d:t}")
+  done
+  _describe -t templates 'template' names
+}
+
+_ws "$@"

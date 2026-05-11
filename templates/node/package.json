@@ -1,0 +1,11 @@
+{
+  "name": "{{name}}",
+  "version": "0.1.0",
+  "description": "{{description}}",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node index.js",
+    "test": "node --test"
+  }
+}

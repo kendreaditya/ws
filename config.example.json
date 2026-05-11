@@ -1,0 +1,35 @@
+{
+  "_comment": "ws config — see ~/.config/ws/README.md. Copy this to config.json and edit.",
+
+  "sources": [
+    {
+      "name": "github",
+      "type": "github-list",
+      "owner": "kendreaditya",
+      "skip_archived": true,
+      "skip_forks": false,
+      "clone_args": ["--filter=blob:limit=1m"],
+      "fetch_args": ["--prune", "--tags"],
+      "create": {
+        "enabled": true,
+        "gh_args": ["--private", "--default-branch=main"]
+      }
+    }
+  ],
+
+  "data_sources": [],
+
+  "projects": {
+    "ws": {
+      "skip": true,
+      "_comment": "Don't sync the ws tool repo into the workspace; the canonical install is at ~/.config/ws/. Remove this entry to also clone ws into ~/workspace/ws (it'll be a second checkout of the same repo)."
+    }
+  },
+
+  "defaults": {
+    "new_remote": "github",
+    "new_template": "empty"
+  },
+
+  "target": "~/workspace"
+}

@@ -1,0 +1,6 @@
+#!/usr/bin/env zsh
+# {{name}} — {{description}}
+
+set -euo pipefail
+
+print -r -- "hello from {{name}}"
