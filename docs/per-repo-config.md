@@ -124,11 +124,9 @@ For a project with both `.ws.json` AND a central config entry:
 
 ## Behavior of `ws adopt` after this change
 
-When the user picks "configure as rsync/mount-link data surface" for a project:
+When the user picks "configure as rsync/mount-link data surface" for a project, **`ws` always writes `.ws.json` IN the project's dir**, regardless of whether the dir is a git repo. Every entry under `~/workspace/` is self-describing via its own `.ws.json`. Git-repo entries also commit it later (manual `git add` by user); non-repo data dirs just keep the file alongside their content.
 
-- **If the project is a git repo** (a `.git` exists): write to `<repo>/.ws.json` (creating it). If the repo has uncommitted changes already, just write and warn — don't auto-commit. User commits when they're ready.
-- **If the project is a data dir (no `.git`)** and user picks "configure as data surface" without also picking "convert to git repo": write to central `projects.<name>.data[]` since there's nowhere else for it to live.
-- **If the project is a data dir AND user picks "convert to git + add data surface"** (a new combined option): do `git init` + create `.ws.json` + commit + push.
+The central `.projects[]` map exists only for reading legacy v0.1 configs during the transition. New writes never go there. `ws config --migrate` is the one-shot tool that lifts old entries out.
 
 ## Migration path
 

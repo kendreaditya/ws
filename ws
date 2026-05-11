@@ -104,6 +104,7 @@ new OPTIONS
   --template <name>      Scaffold from ~/.config/ws/templates/<name>/
   --description <s>      For GitHub repo + seeded into README
   --branch <name>        Initial branch (default: main)
+  --with-data            Scaffold a starter .ws.json (per-repo config)
 
 git OPTIONS
   --source <name>        Limit to one source
@@ -633,36 +634,21 @@ _cfg_add_github_source() {
   _cfg_write "$new"
 }
 
-# Append a data surface to either:
-#   - <repo>/.ws.json (preferred — committed in repo, travels with code)
-#   - central .projects[name].data[] (fallback for non-repo data dirs)
+# Append a data surface to <target>/<name>/.ws.json. Works for both git
+# repos AND non-repo data dirs — every entry is self-describing.
 # $1 = name, $2 = surface JSON object
 _add_data_surface() {
   local name="$1" surface="$2"
   local target=$(cfg_target)
   local dir="$target/$name"
+  [[ -d "$dir" ]] || { err "$name: dir doesn't exist at $dir"; return 1; }
 
-  if [[ -d "$dir/.git" || -f "$dir/.git" ]]; then
-    # repo exists → write to .ws.json
-    local existing=$(_repo_config_read "$name")
-    local merged=$(jq -nc --argjson e "$existing" --argjson s "$surface" \
-      '$e * { data: ((.data // []) | . + [$s]) | unique_by(.path)}')
-    # the unique_by(.path) above isn't quite right with $e merge; do it properly:
-    merged=$(jq -nc --argjson e "$existing" --argjson s "$surface" '
-      ($e // {}) | .data = ((.data // []) + [$s])
-    ')
-    _repo_config_write "$name" "$merged" || return 1
-    info "wrote data surface to $dir/.ws.json"
-  else
-    # non-repo → write to central .projects[name].data (legacy path)
-    _cfg_backup_once
-    local cur=$(cat "$CONFIG")
-    local new=$(jq --arg n "$name" --argjson s "$surface" '
-      .projects = ((.projects // {}) | .[$n] = ((.[$n] // {}) | .data = ((.data // []) + [$s])))
-    ' <<<"$cur")
-    _cfg_write "$new"
-    info "wrote data surface to central config (non-repo dir)"
-  fi
+  local existing=$(_repo_config_read "$name")
+  local merged=$(jq -nc --argjson e "$existing" --argjson s "$surface" '
+    ($e // {}) | .data = ((.data // []) + [$s])
+  ')
+  _repo_config_write "$name" "$merged" || return 1
+  info "wrote data surface to $dir/.ws.json"
 }
 
 # Compatibility wrappers for cmd_adopt's existing call sites.
@@ -1179,7 +1165,7 @@ cmd_clone() {
 
 # ─── cmd: new ──────────────────────────────────────────────────────────────
 cmd_new() {
-  local name="" remote="" public=0 template="" description="" branch="main"
+  local name="" remote="" public=0 template="" description="" branch="main" with_data=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --remote)      remote="$2"; shift 2 ;;
@@ -1187,7 +1173,8 @@ cmd_new() {
       --template)    template="$2"; shift 2 ;;
       --description) description="$2"; shift 2 ;;
       --branch)      branch="$2"; shift 2 ;;
-      -h|--help)     print -r -- "Usage: ws new <name> [--remote <r>] [--public] [--template <t>] [--description <s>] [--branch <b>]"; return 0 ;;
+      --with-data)   with_data=1; shift ;;
+      -h|--help)     print -r -- "Usage: ws new <name> [--remote <r>] [--public] [--template <t>] [--description <s>] [--branch <b>] [--with-data]"; return 0 ;;
       -*)            die "ws new: unknown flag '$1'" ;;
       *)             [[ -z "$name" ]] && name="$1" || die "ws new: extra argument '$1'"; shift ;;
     esac
@@ -1250,6 +1237,19 @@ cmd_new() {
         WS_NAME="$name" WS_DESC="$desc_safe" perl -i -pe 's/\{\{name\}\}/$ENV{WS_NAME}/g; s/\{\{description\}\}/$ENV{WS_DESC}/g' "$f"
       fi
     done < <(find "$dir" -type f -not -path '*/.git/*')
+  fi
+
+  # optionally scaffold .ws.json (per-repo config) with a starter template
+  if [[ "$with_data" == "1" ]]; then
+    cat > "$dir/.ws.json" <<'EOF'
+{
+  "_comment": "Per-repo ws config. See ~/.config/ws/docs/per-repo-config.md.",
+  "clone_args": [],
+  "post_clone": [],
+  "data": []
+}
+EOF
+    info "scaffolded $dir/.ws.json (edit to add data surfaces)"
   fi
 
   # initial commit if any files exist

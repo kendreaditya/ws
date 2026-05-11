@@ -60,6 +60,7 @@ _ws() {
             '--template[scaffold from template]:template:_ws_templates' \
             '--description[for GitHub repo + README]:desc:' \
             '--branch[initial branch]:branch:' \
+            '--with-data[scaffold .ws.json (per-repo config)]' \
             '1:project name:'
           ;;
         clone)
