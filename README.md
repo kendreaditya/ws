@@ -116,6 +116,48 @@ Per-shape prompt options:
 
 Universal keys in every prompt: `s` = skip-for-now (reappears next run), `A` = apply the same answer to **all remaining items in this category** (great for 88 data dirs), `q` = quit walk, save progress, exit cleanly.
 
+## Per-repo `.ws.json` (project-specific config)
+
+Configuration that belongs to a project (data surfaces, post-clone hooks, sparse-checkout setup) lives in `<repo>/.ws.json`, committed alongside the code. It travels with the repo.
+
+```json
+// <repo>/.ws.json — example for a hybrid code+data repo
+{
+  "post_clone": ["git sparse-checkout set src configs"],
+  "data": [
+    {
+      "path":   "photos",
+      "mode":   "link",
+      "source": "data-mount",
+      "local":  "/Volumes/data/weekly-photo-wall/photos"
+    }
+  ]
+}
+```
+
+After `ws sync` clones (or fetches) a repo, it reads the repo's `.ws.json` and:
+
+- Runs any `post_clone` commands.
+- Auto-creates symlinks for `mode: link` data surfaces (skipped with stderr warning if the mount isn't available).
+- Notes `mode: rsync` surfaces but does NOT auto-pull (use `ws data pull <name>` explicitly).
+
+```bash
+ws config compass             # open <repo>/.ws.json in $EDITOR (creates if missing)
+ws config compass --print     # show effective merged config (repo + central)
+ws config --migrate           # one-shot: move central .projects[*] into per-repo .ws.json
+```
+
+Central `~/.config/ws/config.json` keeps only what's per-machine or pre-existence:
+
+- `sources[]` — where repos come from
+- `data_sources[]` — where data mounts/hosts are (paths differ per machine)
+- `defaults` — `ws new` fallbacks
+- `skip_list[]` — names to silently skip
+- `clone_overrides{}` — rare per-repo flag overrides needed BEFORE the repo is cloned (chicken-and-egg)
+- `target` — workspace location
+
+See [`docs/per-repo-config.md`](docs/per-repo-config.md) for the full design.
+
 ## Data surfaces
 
 For projects where the code is in git but the bulk data isn't:

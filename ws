@@ -85,6 +85,8 @@ COMMANDS
   explain <name>         Show resolved config (source + project) for a repo
   audit                  Classify ~/workspace/* entries (read-only dashboard)
   adopt [name]           Interactive walk to classify unmanaged entries
+  config <name>          Edit/view per-repo .ws.json (see docs/per-repo-config.md)
+  config --migrate       One-shot: move central .projects[*] into per-repo .ws.json
 
 GLOBAL
   --config <path>        Override config (default: ~/.config/ws/config.json)
@@ -123,6 +125,11 @@ adopt OPTIONS
   --only-category <c>    Walk only one category
   --dry-run              Walk + prompt; don't write config or push
   --revert               Restore config.json from most recent backup
+
+config OPTIONS
+  <name>                 Open <repo>/.ws.json in $EDITOR (creates with template if missing)
+  --print                Print effective merged config for <name> (repo + central)
+  --migrate              Export central .projects[*] into per-repo .ws.json files
 
 data SUBCOMMANDS
   status [project]       Show data surfaces: linked, mounted, cached, missing, stale
@@ -316,22 +323,119 @@ match_source_by_url() {
 }
 
 # ─── effective config resolution ───────────────────────────────────────────
-project_is_skipped() {
-  local name="$1"
-  local proj=$(cfg_project_get "$name")
-  [[ $(jq -r '.skip // false' <<<"$proj") == "true" ]]
+# Per-repo config lives at <target>/<name>/.ws.json (committed in the repo).
+# Central config (~/.config/ws/config.json) holds:
+#   - skip_list[]:        names to skip during sync/data
+#   - clone_overrides{}:  pre-existence config (clone_args, post_clone) for repos
+#                         that need special flags BEFORE they're cloned
+#   - projects{}:         LEGACY — same map as v0.1, read as fallback for repos
+#                         that haven't been migrated to per-repo .ws.json yet
+#
+# See ~/.config/ws/docs/per-repo-config.md for the design.
+
+_repo_config_path() {
+  local target=$(cfg_target)
+  print -r -- "$target/$1/.ws.json"
 }
 
-# Resolve effective clone args: project override > source default
+# Read repo's .ws.json — returns "{}" if missing or unreadable.
+_repo_config_read() {
+  local f=$(_repo_config_path "$1")
+  if [[ -f "$f" ]]; then
+    jq -c '.' < "$f" 2>/dev/null || print -r -- "{}"
+  else
+    print -r -- "{}"
+  fi
+}
+
+# Atomic write of .ws.json
+_repo_config_write() {
+  local name="$1" json="$2"
+  local f=$(_repo_config_path "$name")
+  local d="${f%/*}"
+  [[ -d "$d" ]] || { err "$name: repo dir doesn't exist; can't write .ws.json"; return 1; }
+  local tmp=$(mktemp)
+  print -r -- "$json" | jq . > "$tmp" 2>/dev/null \
+    || { rm -f "$tmp"; err ".ws.json content rejected by jq"; return 1; }
+  mv "$tmp" "$f"
+}
+
+# Read central clone_overrides[name] — returns "{}" if missing
+_central_clone_override() {
+  jq -c --arg n "$1" '.clone_overrides[$n] // {}' < "$CONFIG" 2>/dev/null
+}
+
+# Legacy fallback: read central .projects[name]
+_legacy_project_get() {
+  jq -c --arg n "$1" '.projects[$n] // {}' < "$CONFIG" 2>/dev/null
+}
+
+# Read central skip_list[] as a newline-separated stream
+_central_skip_list() {
+  jq -r '.skip_list // [] | .[]' < "$CONFIG" 2>/dev/null
+}
+
+# True if name is in central skip_list, OR has legacy .projects[name].skip = true
+project_is_skipped() {
+  local name="$1"
+  # central skip_list
+  if jq -e --arg n "$name" '.skip_list // [] | index($n) != null' < "$CONFIG" >/dev/null 2>&1; then
+    return 0
+  fi
+  # legacy projects.<name>.skip = true
+  local legacy=$(_legacy_project_get "$name")
+  [[ $(jq -r '.skip // false' <<<"$legacy") == "true" ]]
+}
+
+# Merged effective config for a project. Repo .ws.json wins over central
+# clone_overrides which wins over legacy projects.<name>. Returns JSON object.
+_load_project_config() {
+  local name="$1"
+  local repo=$(_repo_config_read "$name")
+  local central=$(_central_clone_override "$name")
+  local legacy=$(_legacy_project_get "$name")
+  # repo wins over central; central wins over legacy; non-conflicting keys merged.
+  # `*` operator in jq does recursive merge with right-hand winning.
+  jq -nc --argjson r "$repo" --argjson c "$central" --argjson l "$legacy" \
+    '$l * $c * $r'
+}
+
+# Resolve effective clone args.
+# Pre-clone (repo doesn't exist yet): central clone_overrides > legacy > source.
+# Post-existence: repo .ws.json > central > legacy > source.
 resolve_clone_args() {
   local name="$1" src_json="$2"
-  local proj=$(cfg_project_get "$name")
-  local plen=$(jq -r '.clone_args // [] | length' <<<"$proj")
-  if [[ "$plen" -gt 0 ]]; then
-    jq -r '.clone_args[]' <<<"$proj"
-  else
-    jq -r '.clone_args // [] | .[]' <<<"$src_json"
+  local target=$(cfg_target)
+  local repo_dir="$target/$name"
+
+  # If repo exists and has .ws.json with clone_args → use it
+  if [[ -d "$repo_dir/.git" || -f "$repo_dir/.git" ]]; then
+    local rj=$(_repo_config_read "$name")
+    local rl=$(jq -r '.clone_args // [] | length' <<<"$rj")
+    if [[ "$rl" -gt 0 ]]; then
+      jq -r '.clone_args[]' <<<"$rj"
+      return
+    fi
   fi
+
+  # Pre-existence or no repo override: central clone_overrides
+  local co=$(_central_clone_override "$name")
+  local cl=$(jq -r '.clone_args // [] | length' <<<"$co")
+  if [[ "$cl" -gt 0 ]]; then
+    jq -r '.clone_args[]' <<<"$co"
+    return
+  fi
+
+  # Legacy projects.<name>.clone_args
+  local lg=$(_legacy_project_get "$name")
+  local ll=$(jq -r '.clone_args // [] | length' <<<"$lg")
+  if [[ "$ll" -gt 0 ]]; then
+    jq -r '.clone_args[]' <<<"$lg"
+    return
+  fi
+
+  # Source default
+  jq -r '.clone_args // [] | .[]' <<<"$src_json"
 }
 
 resolve_fetch_args() {
@@ -339,8 +443,44 @@ resolve_fetch_args() {
   jq -r '.fetch_args // [] | .[]' <<<"$src_json"
 }
 
+# Post-clone commands. Central runs first (one-time pre-existence setup),
+# then repo .ws.json (every clone/fetch).
+project_post_clone_central() {
+  local name="$1"
+  local co=$(_central_clone_override "$name")
+  jq -r '.post_clone // [] | .[]' <<<"$co"
+  # legacy fallback
+  local lg=$(_legacy_project_get "$name")
+  jq -r '.post_clone // [] | .[]' <<<"$lg"
+}
+
+project_post_clone_repo() {
+  _repo_config_read "$1" | jq -r '.post_clone // [] | .[]'
+}
+
+# Combined for callers that don't care about ordering distinction.
+# Used by sync_repo. Order: central first (one-shot setup), repo second.
 project_post_clone() {
-  cfg_project_get "$1" | jq -r '.post_clone // [] | .[]'
+  project_post_clone_central "$1"
+  project_post_clone_repo "$1"
+}
+
+# Read data surfaces for a project. Repo .ws.json wins; legacy as fallback.
+project_data_surfaces() {
+  local name="$1"
+  local repo=$(_repo_config_read "$name")
+  local rcount=$(jq -r '.data // [] | length' <<<"$repo")
+  if [[ "$rcount" -gt 0 ]]; then
+    jq -c '.data[]' <<<"$repo"
+    return
+  fi
+  local legacy=$(_legacy_project_get "$name")
+  jq -c '.data // [] | .[]' <<<"$legacy"
+}
+
+# Legacy helper retained for cmd_explain — returns merged effective config.
+cfg_project_get_effective() {
+  _load_project_config "$1"
 }
 
 # ─── workspace classification (for audit / adopt) ──────────────────────────
@@ -464,12 +604,16 @@ _cfg_write() {
   mv "$tmp" "$CONFIG"
 }
 
-# Set projects.<name>.skip = true
+# Add name to central .skip_list[] (deduplicated). Replaces v0.1's
+# .projects[name].skip = true pattern, but old form is still read by
+# project_is_skipped as a fallback.
 _cfg_set_project_skip() {
   local name="$1"
   _cfg_backup_once
   local cur=$(cat "$CONFIG")
-  local new=$(jq --arg n "$name" '.projects = ((.projects // {}) | .[$n] = ((.[$n] // {}) | .skip = true))' <<<"$cur")
+  local new=$(jq --arg n "$name" '
+    .skip_list = ((.skip_list // []) | if index($n) then . else . + [$n] end)
+  ' <<<"$cur")
   _cfg_write "$new"
 }
 
@@ -489,30 +633,53 @@ _cfg_add_github_source() {
   _cfg_write "$new"
 }
 
-# Add a rsync data surface to a project.
-# Args: name, source, remote, local, direction
-_cfg_add_data_rsync() {
-  local name="$1" source="$2" remote="$3" local_path="$4" direction="$5"
-  _cfg_backup_once
-  local cur=$(cat "$CONFIG")
-  local new=$(jq --arg n "$name" --arg s "$source" --arg r "$remote" --arg l "$local_path" --arg dir "$direction" '
-    .projects = ((.projects // {}) | .[$n] = ((.[$n] // {}) | .data = ((.data // []) + [{
-      path: ".", mode: "rsync", source: $s, remote: $r, local: $l, direction: $dir
-    }])))' <<<"$cur")
-  _cfg_write "$new"
+# Append a data surface to either:
+#   - <repo>/.ws.json (preferred — committed in repo, travels with code)
+#   - central .projects[name].data[] (fallback for non-repo data dirs)
+# $1 = name, $2 = surface JSON object
+_add_data_surface() {
+  local name="$1" surface="$2"
+  local target=$(cfg_target)
+  local dir="$target/$name"
+
+  if [[ -d "$dir/.git" || -f "$dir/.git" ]]; then
+    # repo exists → write to .ws.json
+    local existing=$(_repo_config_read "$name")
+    local merged=$(jq -nc --argjson e "$existing" --argjson s "$surface" \
+      '$e * { data: ((.data // []) | . + [$s]) | unique_by(.path)}')
+    # the unique_by(.path) above isn't quite right with $e merge; do it properly:
+    merged=$(jq -nc --argjson e "$existing" --argjson s "$surface" '
+      ($e // {}) | .data = ((.data // []) + [$s])
+    ')
+    _repo_config_write "$name" "$merged" || return 1
+    info "wrote data surface to $dir/.ws.json"
+  else
+    # non-repo → write to central .projects[name].data (legacy path)
+    _cfg_backup_once
+    local cur=$(cat "$CONFIG")
+    local new=$(jq --arg n "$name" --argjson s "$surface" '
+      .projects = ((.projects // {}) | .[$n] = ((.[$n] // {}) | .data = ((.data // []) + [$s])))
+    ' <<<"$cur")
+    _cfg_write "$new"
+    info "wrote data surface to central config (non-repo dir)"
+  fi
 }
 
-# Add a mount-link data surface to a project.
-# Args: name, source, local_path
+# Compatibility wrappers for cmd_adopt's existing call sites.
+# These now route to _add_data_surface, which picks .ws.json vs central
+# based on whether the project is a git repo.
+_cfg_add_data_rsync() {
+  local name="$1" source="$2" remote="$3" local_path="$4" direction="$5"
+  local surface=$(jq -nc --arg s "$source" --arg r "$remote" --arg l "$local_path" --arg dir "$direction" \
+    '{path:".", mode:"rsync", source:$s, remote:$r, local:$l, direction:$dir}')
+  _add_data_surface "$name" "$surface"
+}
+
 _cfg_add_data_link() {
   local name="$1" source="$2" local_path="$3"
-  _cfg_backup_once
-  local cur=$(cat "$CONFIG")
-  local new=$(jq --arg n "$name" --arg s "$source" --arg l "$local_path" '
-    .projects = ((.projects // {}) | .[$n] = ((.[$n] // {}) | .data = ((.data // []) + [{
-      path: ".", mode: "link", source: $s, local: $l
-    }])))' <<<"$cur")
-  _cfg_write "$new"
+  local surface=$(jq -nc --arg s "$source" --arg l "$local_path" \
+    '{path:".", mode:"link", source:$s, local:$l}')
+  _add_data_surface "$name" "$surface"
 }
 
 # Append to ~/.config/ws/.ignore (newline-delimited list of loose-file names)
@@ -564,7 +731,7 @@ sync_repo() {
       return 0
     fi
     if git clone "${clone_args[@]}" "$url" "$dir" >> "$log_file" 2>&1; then
-      # run post_clone if any
+      # run post_clone (central first, then repo .ws.json)
       local pc=$(project_post_clone "$name")
       if [[ -n "$pc" ]]; then
         print -r -- "$pc" | while IFS= read -r cmd; do
@@ -573,6 +740,8 @@ sync_repo() {
             || warn "post_clone failed for $name: $cmd"
         done
       fi
+      # auto-materialize link-mode data surfaces from .ws.json (idempotent)
+      _materialize_link_surfaces "$name" "$log_file"
       print -r -- "cloned $name"
     else
       print -r -- "failed $name"
@@ -604,10 +773,51 @@ sync_repo() {
     return 0
   fi
   if git -C "$dir" fetch --all "${fa[@]}" --quiet >> "$log_file" 2>&1; then
+    # idempotent re-materialize of link surfaces (in case .ws.json was just pulled)
+    _materialize_link_surfaces "$name" "$log_file"
     print -r -- "fetched $name"
   else
     print -r -- "failed $name"
   fi
+}
+
+# Materialize mode=link surfaces from a project's .ws.json.
+# Idempotent: existing correct symlinks are left alone. Missing mounts
+# are warned (stderr) and skipped, not errors. rsync-mode surfaces are
+# intentionally NOT auto-pulled (use `ws data pull <name>` explicitly).
+_materialize_link_surfaces() {
+  local name="$1" log_file="$2"
+  local target=$(cfg_target)
+  local dir="$target/$name"
+
+  project_data_surfaces "$name" | while IFS= read -r surface; do
+    [[ -z "$surface" ]] && continue
+    local mode=$(jq -r '.mode' <<<"$surface")
+    [[ "$mode" != "link" ]] && continue
+    local surf_path=$(jq -r '.path' <<<"$surface")
+    local src_name=$(jq -r '.source' <<<"$surface")
+    local local_p=$(jq -r '.local // empty' <<<"$surface")
+    local ds=$(cfg_data_source_by_name "$src_name")
+    [[ -z "$ds" ]] && { warn "$name:$surf_path references unknown data_source '$src_name'"; continue; }
+    local mount_root=$(jq -r '.mount_root // empty' <<<"$ds")
+    local resolved=$(expand_path "$local_p")
+    [[ -z "$resolved" && -n "$mount_root" ]] && resolved="$mount_root/$name/$surf_path"
+    if [[ ! -d "$mount_root" ]]; then
+      warn "$name:$surf_path mount '$mount_root' not available — skipping link"
+      continue
+    fi
+    local link_path="$dir/$surf_path"
+    if [[ -L "$link_path" && "$(readlink "$link_path")" == "$resolved" ]]; then
+      continue   # already correct
+    fi
+    if [[ -e "$link_path" && ! -L "$link_path" ]]; then
+      warn "$name:$surf_path real path exists at $link_path; not overwriting"
+      continue
+    fi
+    ln -sf "$resolved" "$link_path" 2>>"$log_file" \
+      && info "linked $name:$surf_path -> $resolved" \
+      || warn "failed to link $name:$surf_path"
+  done
 }
 
 # ─── arg parsing helpers ───────────────────────────────────────────────────
@@ -1590,15 +1800,30 @@ cmd_data() {
   require_config
   local target=$(cfg_target)
 
-  # iterate projects with .data[]
-  jq -r '.projects // {} | to_entries | .[] | select(.value.data != null) | .key' < "$CONFIG" \
-    | while IFS= read -r pname; do
-        [[ -n "$project_filter" && "$pname" != "$project_filter" ]] && continue
-        local proj=$(cfg_project_get "$pname")
-        jq -c '.data[]' <<<"$proj" | while IFS= read -r surface; do
-          data_one "$sub" "$pname" "$surface" "$dry" "$delete" "$itemize"
-        done
-      done
+  # Build the union of projects that have data surfaces:
+  #   - any <target>/<name>/.ws.json with .data[]
+  #   - any legacy .projects[name].data[] in central config
+  local -A seen
+  if [[ -d "$target" ]]; then
+    for d in "$target"/*(N/); do
+      local pname="${d##*/}"
+      [[ -f "$d/.ws.json" ]] || continue
+      local cnt=$(jq -r '.data // [] | length' < "$d/.ws.json" 2>/dev/null || echo 0)
+      [[ "$cnt" -gt 0 ]] && seen[$pname]=1
+    done
+  fi
+  while IFS= read -r legacy_name; do
+    [[ -n "$legacy_name" ]] && seen[$legacy_name]=1
+  done < <(jq -r '.projects // {} | to_entries | .[] | select(.value.data != null) | .key' < "$CONFIG" 2>/dev/null)
+
+  # Iterate
+  for pname in "${(@k)seen}"; do
+    [[ -n "$project_filter" && "$pname" != "$project_filter" ]] && continue
+    while IFS= read -r surface; do
+      [[ -z "$surface" ]] && continue
+      data_one "$sub" "$pname" "$surface" "$dry" "$delete" "$itemize"
+    done < <(project_data_surfaces "$pname")
+  done
 }
 
 data_one() {
@@ -2287,6 +2512,133 @@ cmd_adopt() {
   rm -f "$WS_ADOPT_LOG"
 }
 
+# ─── cmd: config ───────────────────────────────────────────────────────────
+# Manage per-repo .ws.json. Three modes:
+#   ws config <name>            — open <repo>/.ws.json in $EDITOR (create with starter if missing)
+#   ws config <name> --print    — print effective merged config (repo + central) as JSON
+#   ws config --migrate         — one-shot: export central .projects[*] to per-repo .ws.json files
+cmd_config() {
+  local migrate=0 print_mode=0 name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --migrate)  migrate=1; shift ;;
+      --print)    print_mode=1; shift ;;
+      -h|--help)  print -r -- "Usage: ws config <name> [--print] | ws config --migrate"; return 0 ;;
+      -*)         die "ws config: unknown flag '$1'" ;;
+      *)          [[ -z "$name" ]] && name="$1" || die "ws config: extra arg '$1'"; shift ;;
+    esac
+  done
+
+  require_config
+
+  if [[ "$migrate" == "1" ]]; then
+    _config_migrate_all
+    return $?
+  fi
+
+  [[ -z "$name" ]] && die "Usage: ws config <name> [--print] | ws config --migrate"
+
+  local target=$(cfg_target)
+  local dir="$target/$name"
+  [[ -d "$dir" ]] || die "$name: not under $target"
+
+  if [[ "$print_mode" == "1" ]]; then
+    _load_project_config "$name" | jq .
+    return 0
+  fi
+
+  # Edit mode: ensure .ws.json exists, then open in $EDITOR
+  local f="$dir/.ws.json"
+  if [[ ! -f "$f" ]]; then
+    cat > "$f" <<'EOF'
+{
+  "_comment": "Per-repo ws config. See ~/.config/ws/docs/per-repo-config.md.",
+  "clone_args": [],
+  "post_clone": [],
+  "data": []
+}
+EOF
+    ok "created $f"
+  fi
+  "${EDITOR:-vi}" "$f"
+  # validate
+  if ! jq empty < "$f" 2>/dev/null; then
+    err "$f is not valid JSON after edit — fix it before ws will read it"
+    return 1
+  fi
+  ok "saved $f"
+}
+
+# One-shot: read central .projects[*], write each to <repo>/.ws.json (if repo
+# exists locally), then remove the entry from central. Idempotent.
+_config_migrate_all() {
+  local target=$(cfg_target)
+  local cur=$(cat "$CONFIG")
+  local -a names
+  names=(${(f)"$(jq -r '.projects // {} | keys[]' <<<"$cur" 2>/dev/null)"})
+  [[ ${#names[@]} -eq 0 ]] && { info "no legacy .projects entries to migrate"; return 0; }
+
+  _cfg_backup_once
+  local migrated=0 deferred=0
+  local -a still_central
+  for n in "${names[@]}"; do
+    local legacy=$(jq -c --arg n "$n" '.projects[$n]' <<<"$cur")
+    # only migrate clone_args / post_clone / data (skip → skip_list; other fields ignored)
+    local repo_obj=$(jq '
+      with_entries(select(.key | IN("clone_args","post_clone","data")))
+      | if length == 0 then null else . end
+    ' <<<"$legacy")
+    local is_skip=$(jq -r '.skip // false' <<<"$legacy")
+    local dir="$target/$n"
+
+    # If skip is true → add to skip_list, remove from projects
+    if [[ "$is_skip" == "true" ]]; then
+      cur=$(jq --arg n "$n" '
+        .skip_list = ((.skip_list // []) | if index($n) then . else . + [$n] end)
+        | .projects |= del(.[$n])
+      ' <<<"$cur")
+      info "migrated skip: $n → skip_list[]"
+      migrated=$((migrated+1))
+      continue
+    fi
+
+    # If no portable fields, drop the entry (was only legacy meta)
+    if [[ "$repo_obj" == "null" ]]; then
+      cur=$(jq --arg n "$n" '.projects |= del(.[$n])' <<<"$cur")
+      info "dropped (no portable fields): $n"
+      migrated=$((migrated+1))
+      continue
+    fi
+
+    # Repo doesn't exist locally → defer (keep in central for now)
+    if [[ ! -d "$dir" ]]; then
+      warn "deferred: $n (no local repo at $dir)"
+      deferred=$((deferred+1))
+      still_central+=("$n")
+      continue
+    fi
+
+    # Write .ws.json
+    local existing="{}"
+    [[ -f "$dir/.ws.json" ]] && existing=$(jq -c '.' < "$dir/.ws.json" 2>/dev/null || print -r -- "{}")
+    local merged=$(jq -nc --argjson e "$existing" --argjson r "$repo_obj" '$e * $r')
+    print -r -- "$merged" | jq . > "$dir/.ws.json.tmp" \
+      && mv "$dir/.ws.json.tmp" "$dir/.ws.json" \
+      || { warn "failed write: $dir/.ws.json"; still_central+=("$n"); continue; }
+    cur=$(jq --arg n "$n" '.projects |= del(.[$n])' <<<"$cur")
+    ok "migrated: $n → $dir/.ws.json"
+    migrated=$((migrated+1))
+  done
+
+  _cfg_write "$cur"
+  print -r -- ""
+  info "migrated $migrated, deferred $deferred (still in central .projects)"
+  if [[ "$deferred" -gt 0 ]]; then
+    info "deferred names: ${still_central[*]}"
+    info "(they'll migrate next time you run 'ws config --migrate' after the repo exists locally)"
+  fi
+}
+
 # ─── dispatch ──────────────────────────────────────────────────────────────
 main() {
   parse_global_flags "$@"
@@ -2320,6 +2672,7 @@ main() {
     data)           cmd_data "$@" ;;
     audit)          cmd_audit "$@" ;;
     adopt)          cmd_adopt "$@" ;;
+    config)         cmd_config "$@" ;;
     *)              die "unknown command: $cmd (try 'ws --help')" ;;
   esac
 }

@@ -25,6 +25,7 @@ _ws() {
     'explain:Show resolved config for a repo'
     'audit:Classify ~/workspace/* entries (read-only)'
     'adopt:Interactive walk to classify unmanaged entries'
+    'config:Edit/view per-repo .ws.json'
     'help:Show help'
     'version:Show ws version'
   )
@@ -139,6 +140,12 @@ _ws() {
             '--dry-run[walk + prompt, do not write]' \
             '--revert[restore config.json from most recent backup]' \
             '1::entry name:_ws_repos'
+          ;;
+        config)
+          _arguments \
+            '--print[print effective merged config]' \
+            '--migrate[bulk-migrate central .projects to per-repo .ws.json]' \
+            '1::repo name:_ws_repos'
           ;;
       esac
       ;;
