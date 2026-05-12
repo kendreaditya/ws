@@ -33,11 +33,19 @@ fpath=(~/.config/ws/completions $fpath); autoload -U compinit && compinit
 ## Daily commands
 
 ```bash
+ws doctor                          # health summary: git, data mounts, unmanaged entries
 ws sync                            # clone new, fetch existing across all sources
 ws sync --source github            # one source only
-ws sync --dry-run --verbose        # print resolved git commands per repo
+ws sync --dry-run                  # quiet summary; use --verbose for every repo/action
 
-ws status                          # auto-scoped if inside a repo, else workspace-wide
+ws status                          # fast async summary; only prints repos needing attention
+ws status --verbose                # current-style per-repo status dump
+ws pull --safe                     # ff-only on clean+behind repos
+
+ws data status                     # summary of mounts, root aliases, and project surfaces
+ws data status weekly-photo-wall   # just one project
+ws data link                       # repair mount-link symlinks
+
 ws list                            # full dashboard: dirty / ahead / behind / last_fetch / remote
 ws size                            # disk usage table sorted descending
 
@@ -46,7 +54,6 @@ ws git -- log --oneline -5         # run git in every (or current) repo
 ws git --all -- fetch --tags       # explicit workspace-wide
 
 ws push                            # bulk push of dirty+ahead, with y/N confirm
-ws pull --safe                     # ff-only on clean+behind repos
 
 ws new my-thing                    # github + private + main + empty template (all from config)
 ws new my-tool --template zsh-cli  # scaffold from ~/.config/ws/templates/zsh-cli/
@@ -58,6 +65,19 @@ ws git clone https://github.com/facebook/react
                                    # safe alias to ws clone; external GitHub uses --filter=blob:none
 ws explain <name>                  # show resolved config (source + project override)
 ```
+
+The default Python CLI is async and anomaly-first. Global flags work before or
+after the command:
+
+```bash
+ws status --json
+ws audit --verbose
+ws sync --dry-run --jobs 8
+ws --no-color doctor
+```
+
+Rare interactive lifecycle commands that have not yet been rewritten in Python
+delegate to `~/.config/ws/ws.legacy`.
 
 ## Less daily but important
 
