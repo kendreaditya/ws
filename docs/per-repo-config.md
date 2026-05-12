@@ -64,6 +64,14 @@ All fields optional. Empty `{}` is valid (means "no project-level overrides").
 
   "skip_list": [ "ws", "linux-fork" ],
 
+  "adopted_repos": {
+    "react": {
+      "kind": "third-party",
+      "origin": "https://github.com/facebook/react.git",
+      "adopted_at": "2026-05-11T22:00:00Z"
+    }
+  },
+
   "clone_overrides": {
     "huge-monorepo": {
       "clone_args": ["--filter=blob:none", "--sparse"],
@@ -74,6 +82,8 @@ All fields optional. Empty `{}` is valid (means "no project-level overrides").
 ```
 
 `skip_list` replaces the per-name `projects.<name>.skip = true`. Flat list of names.
+
+`adopted_repos` records intentional non-source clones so `ws adopt` does not keep asking about them. Valid `kind` values are `third-party`, `fork-backed`, and `owned`.
 
 `clone_overrides` is the **escape hatch for things needed before the repo exists** (initial clone args + first-clone post_clone). Empty `{}` by default. Most projects don't need this.
 
@@ -105,6 +115,7 @@ For a project with both `.ws.json` AND a central config entry:
 5. After successful clone or fetch, read `<target>/<name>/.ws.json` (if it exists):
    - Run `post_clone` commands (idempotent).
    - For each `data[]` entry, materialize (link or rsync) per its mode.
+   - Materialize top-level data aliases from `mount-link` data sources, skipping names already occupied by repos or other workspace entries.
 6. Run `clone_overrides[name].post_clone` (if set) — for first-time setup that the repo itself can't bootstrap.
 
 `ws data status / link / pull / push`:

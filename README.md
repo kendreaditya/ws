@@ -53,7 +53,9 @@ ws new my-tool --template zsh-cli  # scaffold from ~/.config/ws/templates/zsh-cl
 ws new my-data --remote homelab    # use the bare-git remote on your server
 ws new local-thing --remote none   # local-only repo, no remote setup
 
-ws clone <url>                     # picks source/args by URL host
+ws clone <url>                     # picks source/args; external GitHub becomes adopted third-party
+ws git clone https://github.com/facebook/react
+                                   # safe alias to ws clone; external GitHub uses --filter=blob:none
 ws explain <name>                  # show resolved config (source + project override)
 ```
 
@@ -82,7 +84,8 @@ ws adopt                           # interactive walk: classify each unmanaged e
 `ws audit` answers "what's in my workspace and how does ws see it?" — categorizes every top-level entry into one of:
 
 - **managed** — git repo whose origin URL matches a configured source
-- **third-party** — git repo with an origin that doesn't match any source (e.g. `SakanaAI/AI-Scientist`)
+- **adopted** — git repo explicitly marked as third-party, fork-backed, or owned/manual
+- **third-party** — git repo with an origin that doesn't match any source and has not been adopted yet (e.g. `SakanaAI/AI-Scientist`)
 - **local-only** — git repo with no remote
 - **data** — directory, no `.git`
 - **loose** — regular file at workspace root
@@ -91,7 +94,7 @@ ws adopt                           # interactive walk: classify each unmanaged e
 ```bash
 ws audit                           # all categories, grouped table
 ws audit --category third-party    # just one bucket
-ws audit --category unmanaged      # everything that's not managed/skipped
+ws audit --category unmanaged      # everything that's not managed/adopted/skipped
 ws audit --json                    # NDJSON for piping to scripts
 ```
 
@@ -109,7 +112,7 @@ Per-shape prompt options:
 
 | Entry shape | Choices |
 |---|---|
-| third-party git repo | leave alone / add owner as a github-list source / mark skip |
+| third-party git repo | leave alone / mark third-party / mark fork-backed / mark owned-manual / add owner as a github-list source / mark skip |
 | local-only git repo | leave / push to github / push to homelab / mark skip |
 | data dir | leave / rsync surface / mount-link surface / git-init+push github / git-init+push homelab / mark skip |
 | loose file | leave / move to `_archive/` / mark in `.ignore` |
@@ -139,6 +142,7 @@ After `ws sync` clones (or fetches) a repo, it reads the repo's `.ws.json` and:
 
 - Runs any `post_clone` commands.
 - Auto-creates symlinks for `mode: link` data surfaces (skipped with stderr warning if the mount isn't available).
+- Auto-creates root aliases for top-level dirs in `mount-link` data sources, unless a workspace entry already exists at that name.
 - Notes `mode: rsync` surfaces but does NOT auto-pull (use `ws data pull <name>` explicitly).
 
 ```bash
@@ -153,6 +157,7 @@ Central `~/.config/ws/config.json` keeps only what's per-machine or pre-existenc
 - `data_sources[]` — where data mounts/hosts are (paths differ per machine)
 - `defaults` — `ws new` fallbacks
 - `skip_list[]` — names to silently skip
+- `adopted_repos{}` — explicit decisions for third-party, fork-backed, and owned/manual clones
 - `clone_overrides{}` — rare per-repo flag overrides needed BEFORE the repo is cloned (chicken-and-egg)
 - `target` — workspace location
 
@@ -190,7 +195,7 @@ Two data modes:
       "owner": "kendreaditya",
       "skip_archived": true,
       "skip_forks": false,
-      "clone_args": ["--filter=blob:limit=1m"],
+      "clone_args": ["--filter=blob:none"],
       "fetch_args": ["--prune", "--tags"],
       "create": { "enabled": true, "gh_args": ["--private", "--default-branch=main"] }
     },
@@ -218,9 +223,18 @@ Two data modes:
     {
       "name": "nitai-mounted",
       "type": "mount-link",
-      "mount_root": "/Volumes/nitai/workspace"
+      "mount_root": "/Volumes/nitai/workspace",
+      "root_aliases": true
     }
   ],
+
+  "adopted_repos": {
+    "react": {
+      "kind": "third-party",
+      "origin": "https://github.com/facebook/react.git",
+      "adopted_at": "2026-05-11T22:00:00Z"
+    }
+  },
 
   "projects": {
     "ws":         { "skip": true },
@@ -263,6 +277,8 @@ Two data modes:
 | `data_sources[].host` / `remote_path` / `glob` | strings | rsync-glob discovery |
 | `data_sources[].rsync_args` / `exclude` | array | Raw rsync flags, additive by default |
 | `data_sources[].mount_root` | path | mount-link: where the server is mounted (e.g. `/Volumes/nitai/workspace`) |
+| `data_sources[].root_aliases` | bool | mount-link: create `~/workspace/<name> -> <mount_root>/<name>` aliases for top-level data dirs; default true |
+| `adopted_repos[<name>].kind` | enum | `third-party`, `fork-backed`, or `owned`; suppresses future adopt prompts for intentional external clones |
 | `projects[<name>].skip` | bool | Discovery sees it but sync/data skip it. Shipped `true` for `ws` itself. |
 | `projects[<name>].clone_args` | array | Per-repo override of source `clone_args` |
 | `projects[<name>].post_clone` | array | Shell commands run inside repo after clone (e.g. `git sparse-checkout set ...`) |

@@ -69,7 +69,7 @@ COMMANDS
   sync                   Clone new repos and fetch existing ones across all sources
   data <subcommand>      Manage project data dirs (rsync caches + mount symlinks)
   new <name>             Create a new project (local + optional remote)
-  clone <url>            Drop-in `git clone` that auto-picks source/args by URL host
+  clone <url>            Drop-in `git clone`; unmatched GitHub URLs become adopted third-party clones
   git <args>             Run git command in every repo (or filtered subset)
   status                 Shortcut: ws git status -sb
   list                   Show all repos: source, args, remote, last fetch, dirty
@@ -118,7 +118,7 @@ push / pull / prune / stale OPTIONS
 
 audit OPTIONS
   --source <name>        Filter by entries whose origin matches this source
-  --category <c>         managed | skipped | third-party | local-only | data | loose | unmanaged
+  --category <c>         managed | adopted | skipped | third-party | local-only | data | loose | unmanaged
   --json                 NDJSON output (machine-readable)
 
 adopt OPTIONS
@@ -198,6 +198,10 @@ cfg_default() {
 
 cfg_source_by_name() {
   jq -c --arg n "$1" '(.sources // [])[] | select(.name == $n)' < "$CONFIG" 2>/dev/null
+}
+
+cfg_adopted_repo_get() {
+  jq -c --arg n "$1" '.adopted_repos[$n] // {}' < "$CONFIG" 2>/dev/null
 }
 
 # ─── source discovery ──────────────────────────────────────────────────────
@@ -356,6 +360,25 @@ canonical_repo_url() {
 
 repo_urls_equivalent() {
   [[ "$(canonical_repo_url "$1")" == "$(canonical_repo_url "$2")" ]]
+}
+
+github_repo_owner() {
+  local canon=$(canonical_repo_url "$1")
+  [[ "$canon" == github.com/*/* ]] || { print -r -- ""; return 1; }
+  local rest="${canon#github.com/}"
+  print -r -- "${rest%%/*}"
+}
+
+github_repo_name() {
+  local canon=$(canonical_repo_url "$1")
+  [[ "$canon" == github.com/*/* ]] || { print -r -- ""; return 1; }
+  local rest="${canon#github.com/}"
+  rest="${rest#*/}"
+  print -r -- "${rest%%/*}"
+}
+
+is_github_repo_url() {
+  [[ -n "$(github_repo_owner "$1" 2>/dev/null)" && -n "$(github_repo_name "$1" 2>/dev/null)" ]]
 }
 
 # ─── effective config resolution ───────────────────────────────────────────
@@ -541,6 +564,7 @@ cfg_project_get_effective() {
 # Categorizes each top-level entry under $target into one of:
 #   managed     — git repo whose origin matches a configured source pattern
 #                 AND project.skip is not true
+#   adopted     — git repo explicitly adopted as third-party / fork-backed / owned
 #   skipped     — projects.<name>.skip = true in config
 #   third-party — git repo with origin set, but no source pattern matches
 #   local-only  — git repo, no origin remote
@@ -554,7 +578,7 @@ _classify_workspace() {
   local target=$(cfg_target)
   [[ -d "$target" ]] || return 0
 
-  local d name origin sname proj_skip size_bytes last_ct suggestion category
+  local d name origin sname proj_skip size_bytes last_ct suggestion category adopted adopted_kind
 
   for d in "$target"/*(N) "$target"/.*(N); do
     name="${d##*/}"
@@ -592,14 +616,22 @@ _classify_workspace() {
           category="managed"
           suggestion="source: $sname"
         else
-          category="third-party"
-          suggestion="leave alone (or add owner as a source)"
+          adopted=$(cfg_adopted_repo_get "$name")
+          adopted_kind=$(jq -r '.kind // empty' <<<"$adopted")
+          if [[ -n "$adopted_kind" ]]; then
+            category="adopted"
+            suggestion="adopted: $adopted_kind"
+          else
+            category="third-party"
+            suggestion="leave alone (or mark adopted / add owner as a source)"
+          fi
         fi
       fi
       jq -nc --arg n "$name" --arg c "$category" --arg p "$d" \
              --argjson sb "$size_bytes" --arg o "${origin:-}" \
-             --argjson lct "$last_ct" --arg s "$suggestion" \
-        '{name:$n, category:$c, path:$p, size_bytes:$sb, origin:$o, last_commit_ts:$lct, suggestion:$s}'
+             --argjson lct "$last_ct" --arg s "$suggestion" --arg ak "${adopted_kind:-}" \
+        '{name:$n, category:$c, path:$p, size_bytes:$sb, origin:$o, last_commit_ts:$lct, suggestion:$s}
+         + (if $ak == "" then {} else {adoption_kind:$ak} end)'
     else
       category="data"
       suggestion=$(_suggest_data "$name" "$size_bytes")
@@ -684,6 +716,21 @@ _cfg_add_github_source() {
       fetch_args: ["--prune", "--tags"],
       create: { enabled: false }
     }])' <<<"$cur")
+  _cfg_write "$new"
+}
+
+_cfg_adopt_repo() {
+  local name="$1" kind="$2" origin="$3"
+  _cfg_backup_once
+  local cur=$(cat "$CONFIG")
+  local now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local new=$(jq --arg n "$name" --arg k "$kind" --arg o "$origin" --arg t "$now" '
+    .adopted_repos[$n] = {
+      kind: $k,
+      origin: $o,
+      adopted_at: $t
+    }
+  ' <<<"$cur")
   _cfg_write "$new"
 }
 
@@ -862,6 +909,89 @@ _materialize_link_surfaces() {
   done
 }
 
+# Top-level data aliases make pure data dirs visible at ~/workspace/<name>.
+# Repo-level .ws.json surfaces still win for paths under a repo; root aliases
+# are only created when nothing already exists at the workspace root name.
+root_data_aliases() {
+  local source_filter="${1:-}" only_glob="${2:-}"
+  cfg_data_sources | while IFS= read -r ds; do
+    local sname=$(jq -r '.name' <<<"$ds")
+    local dtype=$(jq -r '.type' <<<"$ds")
+    local enabled=$(jq -r '.root_aliases // true' <<<"$ds")
+    [[ "$dtype" != "mount-link" || "$enabled" != "true" ]] && continue
+    [[ -n "$source_filter" && "$source_filter" != "$sname" ]] && continue
+    local mount_root=$(jq -r '.mount_root // empty' <<<"$ds")
+    [[ -z "$mount_root" || ! -d "$mount_root" ]] && continue
+    for data_dir in "$mount_root"/*(N/); do
+      local name="${data_dir##*/}"
+      case "$name" in .|..|.DS_Store|.*) continue ;; esac
+      project_is_skipped "$name" && continue
+      if [[ -n "$only_glob" ]]; then
+        case "$name" in ${~only_glob}) ;; *) continue ;; esac
+      fi
+      jq -nc --arg n "$name" --arg s "$sname" --arg p "$data_dir" \
+        '{name:$n, source:$s, path:$p}'
+    done
+  done
+}
+
+root_data_alias_one() {
+  local sub="$1" alias_json="$2" dry="$3" log_file="${4:-/dev/null}"
+  local target=$(cfg_target)
+  local name=$(jq -r '.name' <<<"$alias_json")
+  local resolved=$(jq -r '.path' <<<"$alias_json")
+  local source=$(jq -r '.source' <<<"$alias_json")
+  local link_path="$target/$name"
+
+  case "$sub" in
+    status|plan)
+      if [[ ! -e "$resolved" ]]; then
+        print -r -- "  ${C_Y}$name${C_0}  root-link  source missing ($resolved)"
+      elif [[ -L "$link_path" && "$(readlink "$link_path")" == "$resolved" ]]; then
+        print -r -- "  ${C_G}$name${C_0}  root-link  ok -> $resolved"
+      elif [[ -e "$link_path" || -L "$link_path" ]]; then
+        print -r -- "  ${C_D}$name${C_0}  root-link  skipped; workspace entry exists"
+      else
+        print -r -- "  ${C_Y}$name${C_0}  root-link  needs creation -> $resolved"
+      fi
+      ;;
+    link|sync)
+      if [[ ! -e "$resolved" ]]; then
+        warn "$name root data source missing: $resolved — skipping"
+        return 0
+      fi
+      if [[ -L "$link_path" && "$(readlink "$link_path")" == "$resolved" ]]; then
+        [[ "$sub" == "sync" ]] && print -r -- "data-link-ok $name"
+        return 0
+      fi
+      if [[ -e "$link_path" || -L "$link_path" ]]; then
+        [[ "$sub" == "sync" ]] && print -r -- "data-link-skip $name"
+        return 0
+      fi
+      if [[ "$dry" == "1" ]]; then
+        if [[ "$sub" == "sync" ]]; then
+          print -r -- "would-link-data $name"
+        else
+          print -r -- "  would link: $link_path -> $resolved"
+        fi
+        return 0
+      fi
+      mkdir -p "$target" 2>>"$log_file" || { warn "failed to create workspace target $target"; return 1; }
+      ln -s "$resolved" "$link_path" 2>>"$log_file" \
+        && { [[ "$sub" == "sync" ]] && print -r -- "linked-data $name" || ok "linked $link_path -> $resolved"; } \
+        || { warn "failed to link root data alias $name from source $source"; return 1; }
+      ;;
+  esac
+}
+
+materialize_root_data_aliases() {
+  local dry="$1" source_filter="$2" only_glob="$3" log_file="$4"
+  root_data_aliases "$source_filter" "$only_glob" | while IFS= read -r alias_json; do
+    [[ -z "$alias_json" ]] && continue
+    root_data_alias_one sync "$alias_json" "$dry" "$log_file"
+  done
+}
+
 # ─── arg parsing helpers ───────────────────────────────────────────────────
 parse_global_flags() {
   # Consumes recognized global flags from "$@"; sets POSITIONALS array.
@@ -900,7 +1030,7 @@ cmd_sync() {
   : > "$log_file"  # truncate
 
   local -A counts
-  counts=(cloned 0 fetched 0 would-clone 0 would-fetch 0 skip-collision 0 skip-nogit 0 failed 0)
+  counts=(cloned 0 fetched 0 would-clone 0 would-fetch 0 linked-data 0 would-link-data 0 data-link-skip 0 data-link-ok 0 skip-collision 0 skip-nogit 0 failed 0)
   local -a cloned_list fetched_list failed_list skip_list
 
   # iterate sources once, then per repo dispatch to sync_repo
@@ -944,6 +1074,17 @@ cmd_sync() {
     esac)
   done < <(cfg_sources)
 
+  while IFS= read -r result; do
+    [[ -z "$result" ]] && continue
+    local rkind="${result%% *}" rwhich="${result#* }"
+    counts[$rkind]=$((${counts[$rkind]:-0} + 1))
+    case "$rkind" in
+      linked-data)      ok "linked data $rwhich" ;;
+      would-link-data)  print -r -- "$result" ;;
+      data-link-skip|data-link-ok) ;;
+    esac
+  done < <(materialize_root_data_aliases "$dry" "$source_filter" "$only_glob" "$log_file")
+
   # summary
   print -r -- ""
   print -r -- "${C_B}ws sync summary${C_0}"
@@ -952,9 +1093,11 @@ cmd_sync() {
   if [[ "$dry" == "1" ]]; then
     print -r -- "  would clone:    ${counts[would-clone]:-0}"
     print -r -- "  would fetch:    ${counts[would-fetch]:-0}"
+    print -r -- "  would link data:${counts[would-link-data]:-0}"
   else
     print -r -- "  cloned:         ${counts[cloned]:-0}"
     print -r -- "  fetched:        ${counts[fetched]:-0}"
+    print -r -- "  data linked:    ${counts[linked-data]:-0}"
     print -r -- "  skipped:        $((${counts[skip-collision]:-0} + ${counts[skip-nogit]:-0}))"
     print -r -- "  failed:         ${counts[failed]:-0}"
   fi
@@ -1056,6 +1199,12 @@ cmd_git() {
       *)           passthru+=("$1"); shift ;;
     esac
   done
+
+  if [[ "${passthru[1]:-}" == "clone" && -n "${passthru[2]:-}" ]]; then
+    warn "routing 'ws git clone' to 'ws clone' (safe single-clone behavior)"
+    cmd_clone "${passthru[@]:1}"
+    return $?
+  fi
 
   require_config
   local target=$(cfg_target)
@@ -1179,26 +1328,49 @@ cmd_cd() {
 
 # ─── cmd: clone <url> ──────────────────────────────────────────────────────
 cmd_clone() {
-  [[ $# -lt 1 ]] && die "Usage: ws clone <url>"
-  local url="$1"
+  [[ $# -lt 1 ]] && die "Usage: ws clone [--kind third-party|fork-backed|owned] [--no-adopt] <url>"
+  local adopt_kind="third-party" no_adopt=0 url=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --kind)     adopt_kind="$2"; shift 2 ;;
+      --kind=*)   adopt_kind="${1#*=}"; shift ;;
+      --no-adopt) no_adopt=1; shift ;;
+      -h|--help)  print -r -- "Usage: ws clone [--kind third-party|fork-backed|owned] [--no-adopt] <url>"; return 0 ;;
+      -*)         die "ws clone: unknown flag '$1'" ;;
+      *)          [[ -z "$url" ]] && url="$1" || die "ws clone: extra arg '$1'"; shift ;;
+    esac
+  done
+  [[ -z "$url" ]] && die "Usage: ws clone [--kind third-party|fork-backed|owned] [--no-adopt] <url>"
+  case "$adopt_kind" in third-party|fork-backed|owned) ;; *) die "ws clone: invalid --kind '$adopt_kind'" ;; esac
   require_config
   local sname=$(match_source_by_url "$url")
+  local src="" external_github=0
   if [[ -z "$sname" ]]; then
-    err "no configured source matches URL: $url"
-    print -u 2 -- "  configured patterns:"
-    cfg_sources | while IFS= read -r s; do
-      local n=$(jq -r '.name' <<<"$s")
-      local p=$(source_pattern "$s")
-      print -u 2 -- "    $n: $p"
-    done
-    print -u 2 -- "  add a source to ~/.config/ws/config.json, or use 'git clone' directly."
-    return 1
+    if is_github_repo_url "$url"; then
+      external_github=1
+      sname="external-github"
+      src='{"name":"external-github","type":"github-external","clone_args":["--filter=blob:none"],"fetch_args":["--prune","--tags"]}'
+    else
+      err "no configured source matches URL: $url"
+      print -u 2 -- "  configured patterns:"
+      cfg_sources | while IFS= read -r s; do
+        local n=$(jq -r '.name' <<<"$s")
+        local p=$(source_pattern "$s")
+        print -u 2 -- "    $n: $p"
+      done
+      print -u 2 -- "  add a source to ~/.config/ws/config.json, or use 'git clone' directly."
+      return 1
+    fi
+  else
+    src=$(cfg_source_by_name "$sname")
   fi
-  local src=$(cfg_source_by_name "$sname")
   local target=$(cfg_target)
   mkdir -p "$target"
-  local name="${url##*/}"
-  name="${name%.git}"
+  local name=$(github_repo_name "$url" 2>/dev/null || true)
+  if [[ -z "$name" ]]; then
+    name="${url##*/}"
+    name="${name%.git}"
+  fi
   local dir="$target/$name"
   [[ -e "$dir" ]] && die "$dir already exists"
 
@@ -1207,7 +1379,11 @@ cmd_clone() {
 
   info "matched source: $sname"
   info "running: git clone ${clone_args[*]} $url $dir"
-  git clone "${clone_args[@]}" "$url" "$dir"
+  git clone "${clone_args[@]}" "$url" "$dir" || return 1
+  if [[ "$external_github" == "1" && "$no_adopt" != "1" ]]; then
+    _cfg_adopt_repo "$name" "$adopt_kind" "$url"
+    ok "marked $name as adopted $adopt_kind"
+  fi
 
   local pc=$(project_post_clone "$name")
   if [[ -n "$pc" ]]; then
@@ -1217,6 +1393,7 @@ cmd_clone() {
       (cd "$dir" && eval "$cmd")
     done
   fi
+  _materialize_link_surfaces "$name" "/dev/null"
 }
 
 # ─── cmd: new ──────────────────────────────────────────────────────────────
@@ -1880,6 +2057,13 @@ cmd_data() {
       data_one "$sub" "$pname" "$surface" "$dry" "$delete" "$itemize"
     done < <(project_data_surfaces "$pname")
   done
+
+  if [[ -z "$project_filter" && "$sub" == (status|plan|link) ]]; then
+    root_data_aliases "" "" | while IFS= read -r alias_json; do
+      [[ -z "$alias_json" ]] && continue
+      root_data_alias_one "$sub" "$alias_json" "$dry" "/dev/null"
+    done
+  fi
 }
 
 data_one() {
@@ -2034,7 +2218,7 @@ cmd_audit() {
   local classified
   classified=$(_classify_workspace | (
     if [[ "$category_filter" == "unmanaged" ]]; then
-      jq -c 'select(.category != "managed" and .category != "skipped")'
+      jq -c 'select(.category != "managed" and .category != "adopted" and .category != "skipped")'
     elif [[ -n "$category_filter" ]]; then
       jq -c --arg c "$category_filter" 'select(.category == $c)'
     else
@@ -2056,7 +2240,7 @@ cmd_audit() {
   fi
 
   # Grouped table output
-  local -a cats; cats=(managed skipped third-party local-only data loose)
+  local -a cats; cats=(managed adopted skipped third-party local-only data loose)
   local cat n entries label total_bytes
   for cat in "${cats[@]}"; do
     entries=$(print -r -- "$classified" | jq -c --arg c "$cat" 'select(.category == $c)' 2>/dev/null)
@@ -2066,6 +2250,7 @@ cmd_audit() {
 
     case "$cat" in
       managed)     label="Managed (${n})" ;;
+      adopted)     label="Adopted git repos (${n})" ;;
       skipped)     label="Skipped via config (${n})" ;;
       third-party) label="Third-party git repos (${n})" ;;
       local-only)  label="Local-only git repos (${n})" ;;
@@ -2081,6 +2266,15 @@ cmd_audit() {
         local names
         names=$(print -r -- "$entries" | jq -r '.name' | paste -sd', ' -)
         print -r -- "  ${C_D}${names}${C_0}"
+        ;;
+      adopted)
+        {
+          printf '%s\t%s\t%s\t%s\n' NAME KIND ORIGIN SIZE
+          print -r -- "$entries" | jq -r '"\(.name)\t\(.adoption_kind // "-")\t\(.origin)\t\(.size_bytes)"' \
+            | while IFS=$'\t' read -r nm kind orig sz; do
+                printf '%s\t%s\t%s\t%s\n' "$nm" "$kind" "$orig" "$(_humanize_bytes "$sz")"
+              done
+        } | column -t -s $'\t' | sed 's/^/  /'
         ;;
       third-party)
         {
@@ -2192,9 +2386,12 @@ _prompt_thirdparty() {
     print -r -- "  origin:      $origin"
     print -r -- "  size:        $(_humanize_bytes "$size_bytes")  last commit: $last_date"
     print -r -- ""
-    print -r -- "  1) leave alone (invisible to ws — no config change)   [default]"
-    print -r -- "  2) add owner as a new github-list source"
-    print -r -- "  3) mark skip (projects.$name.skip = true)"
+    print -r -- "  1) leave alone (will reappear in ws adopt)            [default]"
+    print -r -- "  2) mark adopted: third-party reference clone"
+    print -r -- "  3) mark adopted: fork-backed"
+    print -r -- "  4) mark adopted: owned/manual"
+    print -r -- "  5) add owner as a new github-list source"
+    print -r -- "  6) mark skip"
     print -r -- "  s/A/q"
 
     ans=$(_adopt_read_key ">")
@@ -2203,7 +2400,10 @@ _prompt_thirdparty() {
 
   case "$ans" in
     1)  _adopt_log "leave: $name (third-party)"; return 0 ;;
-    2)
+    2)  _cfg_adopt_repo "$name" "third-party" "$origin"; _adopt_log "adopted-third-party: $name"; ok "marked $name as adopted third-party"; return 0 ;;
+    3)  _cfg_adopt_repo "$name" "fork-backed" "$origin"; _adopt_log "adopted-fork-backed: $name"; ok "marked $name as adopted fork-backed"; return 0 ;;
+    4)  _cfg_adopt_repo "$name" "owned" "$origin"; _adopt_log "adopted-owned: $name"; ok "marked $name as adopted owned/manual"; return 0 ;;
+    5)
       # Parse owner from origin: git@github.com:OWNER/repo[.git] or https://github.com/OWNER/repo
       local owner=$(print -r -- "$origin" | sed -E 's|^git@github\.com:||; s|^https?://github\.com/||; s|/.*$||')
       [[ -z "$owner" ]] && { warn "couldn't parse owner from $origin"; return 0; }
@@ -2213,15 +2413,15 @@ _prompt_thirdparty() {
       ok "added source '$sname' for github.com/$owner/*"
       return 0
       ;;
-    3)  _cfg_set_project_skip "$name"; _adopt_log "skip: $name (third-party)"; return 0 ;;
+    6)  _cfg_set_project_skip "$name"; _adopt_log "skip: $name (third-party)"; return 0 ;;
     s|S)
       _adopt_log "defer: $name (third-party)"
       return 2
       ;;
     A)
-      local sub=$(_adopt_read_key "  apply which answer (1-3) to remaining third-party?")
+      local sub=$(_adopt_read_key "  apply which answer (1-6) to remaining third-party?")
       case "$sub" in
-        1|2|3) _WS_ADOPT_APPLY_THIRDPARTY="$sub"; export _WS_ADOPT_APPLY_THIRDPARTY
+        1|2|3|4|5|6) _WS_ADOPT_APPLY_THIRDPARTY="$sub"; export _WS_ADOPT_APPLY_THIRDPARTY
                # re-invoke with the apply-all memo set
                _prompt_thirdparty "$entry" ;;
         *) warn "invalid; treating as skip-for-now"; return 2 ;;
@@ -2476,6 +2676,7 @@ cmd_adopt() {
     # shadow the mutators with no-op + log
     _cfg_set_project_skip() { _adopt_log "DRY: would set projects.$1.skip = true"; }
     _cfg_add_github_source() { _adopt_log "DRY: would add source $1 (owner=$2)"; }
+    _cfg_adopt_repo() { _adopt_log "DRY: would mark $1 adopted as $2"; }
     _cfg_add_data_rsync() { _adopt_log "DRY: would add rsync data surface for $1"; }
     _cfg_add_data_link() { _adopt_log "DRY: would add mount-link data surface for $1"; }
     _cfg_loose_ignore() { _adopt_log "DRY: would mark $1 in .ignore"; }

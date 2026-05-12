@@ -9,7 +9,7 @@
       "clone_protocol": "https",
       "skip_archived": true,
       "skip_forks": false,
-      "clone_args": ["--filter=blob:limit=1m"],
+      "clone_args": ["--filter=blob:none"],
       "fetch_args": ["--prune", "--tags"],
       "create": {
         "enabled": true,
@@ -22,11 +22,14 @@
     {
       "name": "data-mount",
       "type": "mount-link",
-      "mount_root": "/data"
+      "mount_root": "/data",
+      "root_aliases": true
     }
   ],
 
   "skip_list": [".config", "ws"],
+
+  "adopted_repos": {},
 
   "projects": {
     "ws": {
