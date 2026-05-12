@@ -45,6 +45,9 @@ ws pull --safe                     # ff-only on clean+behind repos
 ws data status                     # summary of mounts, root aliases, and project surfaces
 ws data status weekly-photo-wall   # just one project
 ws data link                       # repair mount-link symlinks
+ws data mount                      # verify/mount /Volumes/data from nitai-node:/data
+ws data remount                    # unmount stale FUSE/SSHFS mount and reconnect
+ws data unmount                    # cleanly detach the data mount
 
 ws list                            # full dashboard: dirty / ahead / behind / last_fetch / remote
 ws size                            # disk usage table sorted descending

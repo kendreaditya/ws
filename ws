@@ -24,7 +24,7 @@ if hasattr(signal, "SIGPIPE"):
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 
-WS_VERSION = "0.3.0"
+WS_VERSION = "0.3.1"
 WS_HOME = Path.home() / ".config" / "ws"
 DEFAULT_CONFIG = WS_HOME / "config.json"
 CONFIG_EXAMPLE = WS_HOME / "config.example.json"
@@ -880,9 +880,11 @@ async def cmd_data(args: list[str], config: dict[str, Any], ui: UI, jobs: int) -
     dry = "--dry-run" in rest
     positional = [a for a in rest if not a.startswith("--")]
     project_filter = positional[0] if positional else ""
-    if sub not in {"status", "plan", "link", "pull", "push"}:
+    if sub not in {"status", "plan", "link", "pull", "push", "mount", "unmount", "remount"}:
         ui.err(f"ws data: unknown subcommand '{sub}'")
         return 2
+    if sub in {"mount", "unmount", "remount"}:
+        return await cmd_data_mount(sub, rest, config, ui)
     if sub in {"pull", "push"}:
         return await cmd_data_rsync(sub, rest, config, ui, jobs or NETWORK_JOBS)
 
@@ -1737,6 +1739,140 @@ async def cmd_adopt(args: list[str], config: dict[str, Any], ui: UI) -> int:
     return 0
 
 
+async def mount_table_contains(path: Path) -> bool:
+    result = await run_cmd(["mount"])
+    return result.returncode == 0 and any(f" on {path} " in line for line in result.stdout.splitlines())
+
+
+async def probe_mount(path: Path, timeout: float = 3.0) -> tuple[bool, str]:
+    if not path_exists_or_link(path):
+        return False, "missing"
+    # Use subprocess timeouts instead of direct pathlib iteration; a stale
+    # FUSE/SSHFS mount can hang Python filesystem calls for a long time.
+    stat_result = await run_cmd(["/bin/ls", "-ld", str(path)], timeout=timeout)
+    if stat_result.returncode == 124:
+        return False, "stale-timeout"
+    if stat_result.returncode != 0:
+        return False, (stat_result.stderr or stat_result.stdout).strip() or "unreadable"
+    list_result = await run_cmd(["/usr/bin/find", str(path), "-maxdepth", "1", "-mindepth", "1", "-print", "-quit"], timeout=timeout)
+    if list_result.returncode == 124:
+        return False, "stale-timeout"
+    if list_result.returncode != 0:
+        return False, (list_result.stderr or list_result.stdout).strip() or "unreadable"
+    return True, "ok"
+
+
+def mount_remote_for_source(ds: dict[str, Any]) -> str:
+    if ds.get("remote"):
+        return str(ds["remote"])
+    host = str(ds.get("host") or os.environ.get("WS_DATA_HOST") or "nitai-node")
+    remote_path = str(ds.get("remote_path") or os.environ.get("WS_DATA_REMOTE") or "/data")
+    return f"{host}:{remote_path}"
+
+
+async def ensure_mountpoint(path: Path, ui: UI) -> bool:
+    if path.exists():
+        return True
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return True
+    except PermissionError:
+        user = os.environ.get("USER", "$(whoami)")
+        sudo = await run_cmd(["sudo", "-n", "mkdir", "-p", str(path)])
+        if sudo.returncode == 0:
+            chown = await run_cmd(["sudo", "-n", "chown", f"{user}:staff", str(path)])
+            if chown.returncode == 0:
+                return True
+        ui.err(f"cannot create {path}; run: sudo mkdir -p {path} && sudo chown {user}:staff {path}")
+        return False
+
+
+async def unmount_path(path: Path, ui: UI) -> bool:
+    if not await mount_table_contains(path):
+        # Clean up stale helper processes if present anyway.
+        await run_cmd(["pkill", "-f", f"sshfs -s .*:{re.escape(str(path))}"])
+        return True
+    result = await run_cmd(["diskutil", "unmount", "force", str(path)], timeout=10)
+    if result.returncode != 0:
+        result = await run_cmd(["umount", "-f", str(path)], timeout=10)
+    await run_cmd(["pkill", "-f", f"sshfs -s .* {re.escape(str(path))}"])
+    await run_cmd(["pkill", "-f", f"go-nfsv4 --volname .* {re.escape(str(path))}"])
+    if result.returncode != 0:
+        ui.err((result.stderr or result.stdout).strip() or f"failed to unmount {path}")
+        return False
+    return True
+
+
+async def mount_source(ds: dict[str, Any], ui: UI) -> bool:
+    path = expand_path(str(ds.get("mount_root") or ""))
+    if not path:
+        ui.err(f"{ds.get('name')}: missing mount_root")
+        return False
+    ok, reason = await probe_mount(path)
+    mounted = await mount_table_contains(path)
+    if ok and mounted:
+        ui.print(f"{ds.get('name')}: mounted ok at {path}")
+        return True
+    if ok and not str(path).startswith("/Volumes/"):
+        ui.print(f"{ds.get('name')}: direct path ok at {path}")
+        return True
+    if mounted:
+        ui.warn(f"{ds.get('name')}: stale mount at {path} ({reason}); unmounting")
+        if not await unmount_path(path, ui):
+            return False
+    if not await ensure_mountpoint(path, ui):
+        return False
+    remote = mount_remote_for_source(ds)
+    ssh_host = remote.split(":", 1)[0]
+    ssh_check = await run_cmd(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh_host, "echo", "ssh-ok"], timeout=8)
+    if ssh_check.returncode != 0:
+        detail = (ssh_check.stderr or ssh_check.stdout).strip()
+        match = re.search(r"https://login\\.tailscale\\.com/\\S+", detail)
+        if match and sys.platform == "darwin":
+            await run_cmd(["open", match.group(0)])
+            ui.err(f"SSH/Tailscale auth is not ready for {ssh_host}; opened auth URL: {match.group(0)}")
+        else:
+            ui.err(f"SSH/Tailscale auth is not ready for {ssh_host}: {detail}")
+        return False
+    sshfs = shutil.which("sshfs")
+    if not sshfs:
+        ui.err("sshfs not found")
+        return False
+    result = await run_cmd([sshfs, "-s", remote, str(path), "-o", "reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,volname=data,no_readahead,sync_readdir,direct_io"], timeout=15)
+    if result.returncode != 0:
+        ui.err((result.stderr or result.stdout).strip() or f"failed to mount {remote} at {path}")
+        return False
+    ok, reason = await probe_mount(path)
+    if not ok:
+        ui.err(f"mounted {path}, but health probe failed: {reason}")
+        return False
+    ui.print(f"{ds.get('name')}: mounted {remote} -> {path}")
+    return True
+
+
+async def cmd_data_mount(sub: str, args: list[str], config: dict[str, Any], ui: UI) -> int:
+    sources = [ds for ds in config.get("data_sources") or [] if ds.get("type") == "mount-link"]
+    if args:
+        wanted = set(a for a in args if not a.startswith("--"))
+        sources = [ds for ds in sources if str(ds.get("name")) in wanted]
+    if not sources:
+        ui.print("No mount-link data sources matched.")
+        return 0
+    rc = 0
+    for ds in sources:
+        path = expand_path(str(ds.get("mount_root") or ""))
+        if sub in {"unmount", "remount"}:
+            if await unmount_path(path, ui):
+                ui.print(f"{ds.get('name')}: unmounted {path}")
+            else:
+                rc = 1
+                continue
+        if sub in {"mount", "remount"}:
+            if not await mount_source(ds, ui):
+                rc = 1
+    return rc
+
+
 async def cmd_data_rsync(sub: str, args: list[str], config: dict[str, Any], ui: UI, jobs: int) -> int:
     dry = "--dry-run" in args
     delete = "--delete" in args
@@ -1837,6 +1973,7 @@ DAILY
   status                 Fast async anomaly-first repo status
   pull --safe            Fast-forward clean behind repos only
   data status [project]  Summarize mounted/symlinked data surfaces
+  data mount|remount     Repair SSHFS/FUSE data mounts
   audit                  Classify ~/workspace entries
 
 OTHER
