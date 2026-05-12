@@ -26,6 +26,8 @@
     }
   ],
 
+  "skip_list": [".config", "ws"],
+
   "projects": {
     "ws": {
       "skip": true,
