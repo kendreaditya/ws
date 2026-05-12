@@ -328,6 +328,36 @@ match_source_by_url() {
   done
 }
 
+canonical_repo_url() {
+  local url="$1"
+  url="${url%.git}"
+
+  case "$url" in
+    git@github.com:*)
+      print -r -- "github.com/${url#git@github.com:}"
+      ;;
+    ssh://git@github.com/*)
+      print -r -- "github.com/${url#ssh://git@github.com/}"
+      ;;
+    https://github.com/*)
+      print -r -- "github.com/${url#https://github.com/}"
+      ;;
+    https://*@github.com/*)
+      print -r -- "github.com/${url#https://*@github.com/}"
+      ;;
+    http://github.com/*)
+      print -r -- "github.com/${url#http://github.com/}"
+      ;;
+    *)
+      print -r -- "$url"
+      ;;
+  esac
+}
+
+repo_urls_equivalent() {
+  [[ "$(canonical_repo_url "$1")" == "$(canonical_repo_url "$2")" ]]
+}
+
 # ─── effective config resolution ───────────────────────────────────────────
 # Per-repo config lives at <target>/<name>/.ws.json (committed in the repo).
 # Central config (~/.config/ws/config.json) holds:
@@ -765,7 +795,7 @@ sync_repo() {
 
   local current_url
   current_url=$(git -C "$dir" remote get-url origin 2>/dev/null || true)
-  if [[ -n "$current_url" && "$current_url" != "$url" ]]; then
+  if [[ -n "$current_url" ]] && ! repo_urls_equivalent "$current_url" "$url"; then
     warn "$name: origin URL mismatch (have '$current_url', expected '$url') — skipping"
     print -r -- "skip-collision $name"
     return 0
