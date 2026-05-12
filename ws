@@ -209,6 +209,7 @@ discover_github() {
   local owner=$(jq -r '.owner' <<<"$src_json")
   local skip_archived=$(jq -r '.skip_archived // false' <<<"$src_json")
   local skip_forks=$(jq -r '.skip_forks // false' <<<"$src_json")
+  local clone_protocol=$(jq -r '.clone_protocol // "https"' <<<"$src_json")
 
   [[ -z "$owner" || "$owner" == "null" ]] && { err "github-list source '$sname' missing 'owner'"; return 1; }
   require_cmd gh
@@ -216,10 +217,14 @@ discover_github() {
   local f='.[]'
   [[ "$skip_archived" == "true" ]] && f+=' | select(.isArchived | not)'
   [[ "$skip_forks" == "true" ]]    && f+=' | select(.isFork | not)'
-  f+=' | {name: .name, url: .sshUrl}'
+  if [[ "$clone_protocol" == "ssh" ]]; then
+    f+=' | {name: .name, url: .sshUrl}'
+  else
+    f+=' | {name: .name, url: .url}'
+  fi
 
   gh repo list "$owner" --limit 200 \
-    --json name,sshUrl,isArchived,isFork \
+    --json name,url,sshUrl,isArchived,isFork \
     --jq "$f" 2>/dev/null \
     | jq -c --arg s "$sname" '. + {source: $s}'
 }

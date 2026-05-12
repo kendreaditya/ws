@@ -6,6 +6,7 @@
       "name": "github",
       "type": "github-list",
       "owner": "kendreaditya",
+      "clone_protocol": "https",
       "skip_archived": true,
       "skip_forks": false,
       "clone_args": ["--filter=blob:limit=1m"],
