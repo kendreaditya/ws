@@ -76,8 +76,7 @@ ws sync --dry-run --jobs 8
 ws --no-color doctor
 ```
 
-Rare interactive lifecycle commands that have not yet been rewritten in Python
-delegate to `~/.config/ws/ws.legacy`.
+All commands are implemented in the Python CLI. The old `ws.legacy` zsh fallback has been removed.
 
 ## Less daily but important
 

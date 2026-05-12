@@ -24,11 +24,10 @@ if hasattr(signal, "SIGPIPE"):
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 
-WS_VERSION = "0.2.0"
+WS_VERSION = "0.3.0"
 WS_HOME = Path.home() / ".config" / "ws"
 DEFAULT_CONFIG = WS_HOME / "config.json"
 CONFIG_EXAMPLE = WS_HOME / "config.example.json"
-LEGACY = WS_HOME / "ws.legacy"
 BIN_LINK = Path.home() / ".local" / "bin" / "ws"
 
 READ_JOBS = 32
@@ -699,7 +698,8 @@ async def cmd_sync(args: list[str], config: dict[str, Any], ui: UI, jobs: int) -
 
 async def cmd_pull(args: list[str], config: dict[str, Any], ui: UI, jobs: int) -> int:
     if "--safe" not in args:
-        return await fallback(args=["pull", *args])
+        ui.err("ws pull requires --safe; use `ws git --all pull` for raw git pull")
+        return 2
     repos = local_repos(config)
     statuses = await gather_limited(repos, jobs or STATUS_JOBS, repo_status)
     pullable = [s for s in statuses if not s.failed and s.dirty == 0 and s.behind > 0 and s.ahead == 0]
@@ -774,7 +774,7 @@ async def cmd_git(args: list[str], config: dict[str, Any], ui: UI, jobs: int) ->
             passthru.append(args[i])
             i += 1
     if len(passthru) >= 2 and passthru[0] == "clone":
-        return await fallback(["clone", *passthru[1:]])
+        return await cmd_clone(passthru[1:], config, ui)
     if not passthru:
         ui.err("ws git: missing git arguments")
         return 2
@@ -884,7 +884,7 @@ async def cmd_data(args: list[str], config: dict[str, Any], ui: UI, jobs: int) -
         ui.err(f"ws data: unknown subcommand '{sub}'")
         return 2
     if sub in {"pull", "push"}:
-        return await fallback(["data", *args])
+        return await cmd_data_rsync(sub, rest, config, ui, jobs or NETWORK_JOBS)
 
     items = collect_data_surfaces(config, project_filter)
     async def state_one(item: tuple[Path, dict[str, Any]]) -> dict[str, Any]:
@@ -1100,6 +1100,691 @@ async def cmd_list(args: list[str], config: dict[str, Any], ui: UI, jobs: int) -
     return 0
 
 
+def source_by_name(config: dict[str, Any], name: str) -> dict[str, Any] | None:
+    for source in config.get("sources") or []:
+        if source.get("name") == name:
+            return source
+    return None
+
+
+def cfg_default(config: dict[str, Any], key: str, fallback: str = "") -> str:
+    defaults = config.get("defaults") or {}
+    return str(defaults.get(key) or fallback)
+
+
+def github_repo_name(url: str) -> str:
+    canon = canonical_repo_url(url)
+    if canon.startswith("github.com/"):
+        rest = canon.removeprefix("github.com/")
+        parts = rest.split("/")
+        if len(parts) >= 2:
+            return parts[1]
+    name = url.rstrip("/").split("/")[-1]
+    return name[:-4] if name.endswith(".git") else name
+
+
+def github_repo_owner(url: str) -> str:
+    canon = canonical_repo_url(url)
+    if canon.startswith("github.com/"):
+        rest = canon.removeprefix("github.com/")
+        parts = rest.split("/")
+        if len(parts) >= 2:
+            return parts[0]
+    return ""
+
+
+def is_github_repo_url(url: str) -> bool:
+    return canonical_repo_url(url).startswith("github.com/")
+
+
+def match_source_by_url(config: dict[str, Any], url: str) -> dict[str, Any] | None:
+    for source in config.get("sources") or []:
+        if repo_matches_source(url, source):
+            return source
+    return None
+
+
+def write_config(path: Path, config: dict[str, Any]) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(config, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def config_backup(path: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(path.name + f".bak-{stamp}")
+    shutil.copyfile(path, backup)
+    return backup
+
+
+def human_size(num: int) -> str:
+    value = float(num)
+    for unit in ["B", "K", "M", "G", "T"]:
+        if value < 1024 or unit == "T":
+            if unit == "B":
+                return f"{int(value)}B"
+            return f"{value:.1f}{unit}".replace(".0", "")
+        value /= 1024
+    return f"{num}B"
+
+
+def confirm(prompt: str) -> bool:
+    if not sys.stdin.isatty():
+        return False
+    answer = input(f"{prompt} [y/N] ").strip().lower()
+    return answer in {"y", "yes"}
+
+
+async def run_foreground(args: list[str], cwd: Path | None = None) -> int:
+    proc = await asyncio.create_subprocess_exec(*args, cwd=str(cwd) if cwd else None)
+    return await proc.wait()
+
+
+async def setup_github_remote(config: dict[str, Any], name: str, repo: Path, public: bool, description: str, ui: UI) -> int:
+    source = source_by_name(config, "github") or source_by_name(config, cfg_default(config, "new_remote")) or {}
+    owner = str(source.get("owner") or "")
+    if not owner:
+        who = await run_cmd(["gh", "api", "user", "--jq", ".login"])
+        owner = who.stdout.strip() if who.returncode == 0 else ""
+    if not owner:
+        ui.err("could not resolve GitHub owner")
+        return 1
+    gh_args = [str(x) for x in ((source.get("create") or {}).get("gh_args") or [])]
+    if public:
+        gh_args = [x for x in gh_args if x != "--private"] + ["--public"]
+    if description:
+        gh_args += ["--description", description]
+    ui.info(f"gh repo create {owner}/{name}")
+    return await run_foreground(["gh", "repo", "create", f"{owner}/{name}", *gh_args, "--source=.", "--push"], cwd=repo)
+
+
+async def setup_homelab_remote(config: dict[str, Any], name: str, repo: Path, branch: str, ui: UI) -> int:
+    source = source_by_name(config, "homelab")
+    if not source:
+        ui.err("no 'homelab' source in config")
+        return 1
+    host = str(source.get("host") or "")
+    root = str(source.get("path") or "")
+    if not host or not root:
+        ui.err("homelab source needs host and path")
+        return 1
+    init = await run_cmd(["ssh", host, f"mkdir -p {root} && cd {root} && git init --bare {name}.git"])
+    if init.returncode != 0:
+        ui.err(init.stderr.strip() or init.stdout.strip() or "homelab bare init failed")
+        return init.returncode
+    url = f"{host}:{root.rstrip('/')}/{name}.git"
+    await git(repo, "remote", "add", "origin", url)
+    await git(repo, "remote", "set-url", "origin", url)
+    return (await run_foreground(["git", "push", "-u", "origin", branch], cwd=repo))
+
+
+async def cmd_cd(args: list[str], config: dict[str, Any], ui: UI) -> int:
+    pattern = args[0] if args else ""
+    target = target_dir(config)
+    if not target.exists():
+        ui.err(f"workspace target missing: {target}")
+        return 1
+    candidates = sorted([p.name for p in target.iterdir() if p.is_dir() or p.is_symlink()], key=str.lower)
+    pick = ""
+    if not pattern:
+        if shutil.which("fzf"):
+            result = await run_cmd(["fzf", "--height=40%", "--reverse"], input_text="\n".join(candidates) + "\n")
+            pick = result.stdout.strip()
+        else:
+            ui.err("no pattern given and fzf not installed")
+            return 1
+    elif pattern in candidates:
+        pick = pattern
+    else:
+        hits = [c for c in candidates if pattern in c]
+        if len(hits) == 1:
+            pick = hits[0]
+        elif len(hits) > 1 and shutil.which("fzf"):
+            result = await run_cmd(["fzf", "--height=40%", "--reverse", f"--query={pattern}"], input_text="\n".join(hits) + "\n")
+            pick = result.stdout.strip()
+        elif hits:
+            pick = hits[0]
+    if not pick:
+        ui.err(f"no match for '{pattern}'")
+        return 1
+    print(str(target / pick))
+    return 0
+
+
+async def cmd_clone(args: list[str], config: dict[str, Any], ui: UI) -> int:
+    adopt_kind = "third-party"
+    no_adopt = False
+    url = ""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--kind" and i + 1 < len(args):
+            adopt_kind = args[i + 1]
+            i += 2
+        elif arg.startswith("--kind="):
+            adopt_kind = arg.split("=", 1)[1]
+            i += 1
+        elif arg == "--no-adopt":
+            no_adopt = True
+            i += 1
+        elif arg in {"-h", "--help"}:
+            print("Usage: ws clone [--kind third-party|fork-backed|owned] [--no-adopt] <url>")
+            return 0
+        elif arg.startswith("-"):
+            ui.err(f"ws clone: unknown flag '{arg}'")
+            return 2
+        elif not url:
+            url = arg
+            i += 1
+        else:
+            ui.err(f"ws clone: extra arg '{arg}'")
+            return 2
+    if not url:
+        ui.err("Usage: ws clone [--kind third-party|fork-backed|owned] [--no-adopt] <url>")
+        return 2
+    if adopt_kind not in {"third-party", "fork-backed", "owned"}:
+        ui.err(f"ws clone: invalid --kind '{adopt_kind}'")
+        return 2
+    source = match_source_by_url(config, url)
+    external_github = False
+    if not source:
+        if not is_github_repo_url(url):
+            ui.err(f"no configured source matches URL: {url}")
+            return 1
+        external_github = True
+        source = {"name": "external-github", "type": "github-external", "clone_args": ["--filter=blob:none"], "fetch_args": ["--prune", "--tags"]}
+    name = github_repo_name(url)
+    target = target_dir(config)
+    target.mkdir(parents=True, exist_ok=True)
+    repo = target / name
+    if path_exists_or_link(repo):
+        ui.err(f"{repo} already exists")
+        return 1
+    spec = RepoSpec(name=name, url=url, source=source)
+    rc = await run_foreground(["git", "clone", *clone_args(config, spec), url, str(repo)])
+    if rc != 0:
+        return rc
+    if external_github and not no_adopt:
+        config.setdefault("adopted_repos", {})[name] = {"kind": adopt_kind, "origin": url, "adopted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        write_config(Path(os.environ.get("WS_CONFIG", DEFAULT_CONFIG)), config)
+        ui.ok(f"marked {name} as adopted {adopt_kind}")
+    await materialize_project_links(config, repo)
+    return 0
+
+
+async def cmd_new(args: list[str], config: dict[str, Any], ui: UI) -> int:
+    name = ""
+    remote = ""
+    public = False
+    template = ""
+    description = ""
+    branch = "main"
+    with_data = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--remote" and i + 1 < len(args):
+            remote = args[i + 1]
+            i += 2
+        elif arg == "--public":
+            public = True
+            i += 1
+        elif arg == "--template" and i + 1 < len(args):
+            template = args[i + 1]
+            i += 2
+        elif arg == "--description" and i + 1 < len(args):
+            description = args[i + 1]
+            i += 2
+        elif arg == "--branch" and i + 1 < len(args):
+            branch = args[i + 1]
+            i += 2
+        elif arg == "--with-data":
+            with_data = True
+            i += 1
+        elif arg in {"-h", "--help"}:
+            print("Usage: ws new <name> [--remote <r>] [--public] [--template <t>] [--description <s>] [--branch <b>] [--with-data]")
+            return 0
+        elif arg.startswith("-"):
+            ui.err(f"ws new: unknown flag '{arg}'")
+            return 2
+        elif not name:
+            name = arg
+            i += 1
+        else:
+            ui.err(f"ws new: extra argument '{arg}'")
+            return 2
+    if not name or "/" in name or name.startswith("."):
+        ui.err("Usage: ws new <name> (name cannot contain '/' or start with '.')")
+        return 2
+    remote = remote or cfg_default(config, "new_remote", "github")
+    template = template or cfg_default(config, "new_template", "empty")
+    if remote not in {"github", "homelab", "none"}:
+        ui.err("--remote must be github | homelab | none")
+        return 2
+    target = target_dir(config)
+    repo = target / name
+    if path_exists_or_link(repo):
+        ui.err(f"{repo} already exists")
+        return 1
+    repo.mkdir(parents=True)
+    await git(repo, "init", "-b", branch, "-q")
+    tpl_dir = WS_HOME / "templates" / template
+    if template and template != "none":
+        if not tpl_dir.exists():
+            ui.err(f"template not found: {tpl_dir}")
+            return 1
+        shutil.copytree(tpl_dir, repo, dirs_exist_ok=True)
+        for path in sorted(repo.rglob("*{{name}}*"), key=lambda p: len(p.parts), reverse=True):
+            path.rename(path.with_name(path.name.replace("{{name}}", name)))
+        for path in repo.rglob("*"):
+            if path.is_file() and ".git" not in path.parts:
+                try:
+                    text = path.read_text()
+                except UnicodeDecodeError:
+                    continue
+                path.write_text(text.replace("{{name}}", name).replace("{{description}}", description or "A new project"))
+    if with_data:
+        (repo / ".ws.json").write_text(json.dumps({"_comment": "Per-repo ws config. See ~/.config/ws/docs/per-repo-config.md.", "clone_args": [], "post_clone": [], "data": []}, indent=2) + "\n")
+    if any(p.name != ".git" for p in repo.iterdir()):
+        await git(repo, "add", "-A")
+        await run_cmd(["git", "-C", str(repo), "-c", "user.useConfigOnly=false", "commit", "-q", "-m", "init"])
+    if remote == "github":
+        rc = await setup_github_remote(config, name, repo, public, description, ui)
+    elif remote == "homelab":
+        rc = await setup_homelab_remote(config, name, repo, branch, ui)
+    else:
+        rc = 0
+    print(str(repo))
+    return rc
+
+
+async def cmd_push(args: list[str], config: dict[str, Any], ui: UI, jobs: int) -> int:
+    dry = "--dry-run" in args
+    only = ""
+    i = 0
+    while i < len(args):
+        if args[i] == "--only" and i + 1 < len(args):
+            only = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    repos = local_repos(config, only=only)
+    statuses = await gather_limited(repos, jobs or STATUS_JOBS, repo_status)
+    candidates = [s for s in statuses if s.ahead > 0 and not s.failed]
+    if not candidates:
+        ui.print("No repos with unpushed commits.")
+        return 0
+    ui.print("Repos with unpushed commits:")
+    for s in candidates:
+        ui.print(f"  - {s.name} ({s.ahead} ahead)")
+    if dry:
+        ui.print("Dry-run: not pushing.")
+        return 0
+    if not confirm("Push all?"):
+        ui.print("aborted")
+        return 0
+    async def one(status: RepoStatus):
+        result = await git(status.path, "push")
+        return status.name, result
+    results = await gather_limited(candidates, jobs or PUSH_JOBS, one)
+    rc = 0
+    for name, result in results:
+        if result.returncode != 0:
+            rc = result.returncode
+            ui.err(f"{name} push failed: {(result.stderr or result.stdout).strip()}")
+    return rc
+
+
+async def cmd_prune(args: list[str], config: dict[str, Any], ui: UI) -> int:
+    source_filter = ""
+    only = ""
+    commit = False
+    archive = False
+    prune_all = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--source" and i + 1 < len(args):
+            source_filter = args[i + 1]
+            i += 2
+        elif args[i] == "--only" and i + 1 < len(args):
+            only = args[i + 1]
+            i += 2
+        elif args[i] == "--commit":
+            commit = True
+            i += 1
+        elif args[i] == "--archive":
+            archive = True
+            i += 1
+        elif args[i] == "--all":
+            prune_all = True
+            i += 1
+        else:
+            i += 1
+    if not source_filter and not prune_all:
+        ui.err("ws prune requires --source <name> or --all")
+        return 2
+    sources = config.get("sources") or []
+    if source_filter:
+        src = source_by_name(config, source_filter)
+        if not src:
+            ui.err(f"no source named '{source_filter}'")
+            return 1
+        sources = [src]
+    rc = 0
+    for source in sources:
+        remote = {spec.name for spec in await discover_all_code({**config, "sources": [source]}, only=only)}
+        local = []
+        for repo in local_repos(config, only=only):
+            origin = (await git(repo, "remote", "get-url", "origin")).stdout.strip()
+            if origin and repo_matches_source(origin, source) and repo.name not in remote:
+                local.append(repo)
+        if not local:
+            ui.print(f"no orphans for source '{source.get('name')}'")
+            continue
+        ui.print(f"Local repos in source '{source.get('name')}' that no longer exist on remote:")
+        for repo in local:
+            ui.print(f"  - {repo.name}")
+        if not commit:
+            ui.print("dry-run: pass --commit to remove/archive")
+            continue
+        if archive:
+            attic = target_dir(config) / ".attic" / time.strftime("%Y-%m-%d")
+            attic.mkdir(parents=True, exist_ok=True)
+            for repo in local:
+                shutil.move(str(repo), str(attic / repo.name))
+        elif confirm("Delete these directories?"):
+            for repo in local:
+                shutil.rmtree(repo)
+        else:
+            ui.print("aborted")
+    return rc
+
+
+async def cmd_stale(args: list[str], config: dict[str, Any], ui: UI, jobs: int) -> int:
+    days = 60
+    only = ""
+    i = 0
+    while i < len(args):
+        if args[i] == "--days" and i + 1 < len(args):
+            days = int(args[i + 1])
+            i += 2
+        elif args[i] == "--only" and i + 1 < len(args):
+            only = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    cutoff = time.time() - days * 86400
+    repos = local_repos(config, only=only)
+    async def one(repo: Path):
+        log = await git(repo, "log", "-1", "--format=%ct")
+        ts = int(log.stdout.strip() or "0") if log.returncode == 0 else 0
+        return repo.name, ts
+    rows = await gather_limited(repos, jobs or STATUS_JOBS, one)
+    print(f"{'NAME':<36} {'DAYS_IDLE':>9} LAST_ACTIVITY")
+    for name, ts in sorted(rows, key=lambda x: x[1]):
+        if ts and ts <= cutoff:
+            idle = int((time.time() - ts) // 86400)
+            print(f"{name:<36} {idle:>9} {time.strftime('%Y-%m-%d', time.localtime(ts))}")
+    return 0
+
+
+async def cmd_size(args: list[str], config: dict[str, Any], ui: UI, jobs: int) -> int:
+    repos = local_repos(config)
+    async def one(repo: Path):
+        result = await run_cmd(["du", "-sk", str(repo)])
+        kb = int(result.stdout.split()[0]) if result.returncode == 0 and result.stdout.split() else 0
+        return repo.name, kb * 1024
+    rows = await gather_limited(repos, jobs or STATUS_JOBS, one)
+    print(f"{'SIZE':>8} NAME")
+    for name, bytes_ in sorted(rows, key=lambda row: row[1], reverse=True):
+        print(f"{human_size(bytes_):>8} {name}")
+    return 0
+
+
+async def cmd_init_remote(args: list[str], config: dict[str, Any], ui: UI) -> int:
+    if not args:
+        ui.err("Usage: ws init-remote <name>")
+        return 2
+    name = args[0]
+    source = source_by_name(config, "homelab")
+    if not source:
+        ui.err("no 'homelab' source in config")
+        return 1
+    host = str(source.get("host") or "")
+    root = str(source.get("path") or "")
+    result = await run_cmd(["ssh", host, f"mkdir -p {root} && cd {root} && git init --bare {name}.git"])
+    if result.returncode == 0:
+        ui.ok(f"created {host}:{root}/{name}.git")
+    else:
+        ui.err(result.stderr.strip() or result.stdout.strip())
+    return result.returncode
+
+
+async def cmd_reclone(args: list[str], config: dict[str, Any], ui: UI) -> int:
+    if not args:
+        ui.err("Usage: ws reclone <name>")
+        return 2
+    name = args[0]
+    repo = target_dir(config) / name
+    if not is_git_repo(repo):
+        ui.err(f"{name} is not a git repo at {repo}")
+        return 1
+    origin = (await git(repo, "remote", "get-url", "origin")).stdout.strip()
+    source = match_source_by_url(config, origin)
+    if not origin or not source:
+        ui.err("origin missing or does not match a configured source")
+        return 1
+    backup = repo.with_name(f"{repo.name}.bak-{int(time.time())}")
+    shutil.move(str(repo), str(backup))
+    spec = RepoSpec(name=name, url=origin, source=source)
+    rc = await run_foreground(["git", "clone", *clone_args(config, spec), origin, str(repo)])
+    if rc != 0:
+        if repo.exists():
+            shutil.rmtree(repo)
+        shutil.move(str(backup), str(repo))
+        return rc
+    await materialize_project_links(config, repo)
+    print(f"Backup at: {backup}")
+    if confirm("Delete backup?"):
+        shutil.rmtree(backup)
+    return 0
+
+
+async def cmd_explain(args: list[str], config: dict[str, Any], ui: UI) -> int:
+    if not args:
+        ui.err("Usage: ws explain <name>")
+        return 2
+    name = args[0]
+    repo = target_dir(config) / name
+    print(f"project: {name}")
+    print(f"  path:  {repo}")
+    origin = ""
+    if is_git_repo(repo):
+        origin = (await git(repo, "remote", "get-url", "origin")).stdout.strip()
+        print(f"  origin: {origin or '(none)'}")
+        source = match_source_by_url(config, origin) if origin else None
+        print(f"  matched source: {source.get('name') if source else '(none)'}")
+    else:
+        print("  origin: (not a git repo)")
+    repo_cfg = read_repo_config(repo)
+    legacy = project_legacy(config, name)
+    merged = {**legacy, **repo_cfg}
+    print("  project config:")
+    print("\n".join("    " + line for line in json.dumps(merged or {}, indent=2).splitlines()))
+    if origin:
+        source = match_source_by_url(config, origin)
+        if source:
+            print("  effective clone_args:")
+            for arg in clone_args(config, RepoSpec(name=name, url=origin, source=source)):
+                print(f"    {arg}")
+    return 0
+
+
+async def cmd_config(args: list[str], config: dict[str, Any], ui: UI) -> int:
+    migrate = "--migrate" in args
+    print_mode = "--print" in args
+    names = [a for a in args if not a.startswith("--")]
+    config_path = Path(os.environ.get("WS_CONFIG", DEFAULT_CONFIG))
+    if migrate:
+        backup = config_backup(config_path)
+        target = target_dir(config)
+        projects = dict(config.get("projects") or {})
+        migrated = 0
+        deferred = 0
+        for name, legacy in list(projects.items()):
+            repo = target / name
+            if legacy.get("skip"):
+                config.setdefault("skip_list", [])
+                if name not in config["skip_list"]:
+                    config["skip_list"].append(name)
+                del config["projects"][name]
+                migrated += 1
+                continue
+            portable = {k: legacy[k] for k in ("clone_args", "post_clone", "data") if k in legacy}
+            if not portable:
+                del config["projects"][name]
+                migrated += 1
+                continue
+            if not repo.exists():
+                deferred += 1
+                continue
+            existing = read_repo_config(repo)
+            existing.update(portable)
+            (repo / ".ws.json").write_text(json.dumps(existing, indent=2) + "\n")
+            del config["projects"][name]
+            migrated += 1
+        write_config(config_path, config)
+        print(f"migrated {migrated}, deferred {deferred}")
+        print(f"backup: {backup}")
+        return 0
+    if not names:
+        ui.err("Usage: ws config <name> [--print] | ws config --migrate")
+        return 2
+    name = names[0]
+    repo = target_dir(config) / name
+    if not repo.exists():
+        ui.err(f"{name}: not under {target_dir(config)}")
+        return 1
+    if print_mode:
+        merged = {**project_legacy(config, name), **read_repo_config(repo)}
+        print(json.dumps(merged, indent=2))
+        return 0
+    path = repo / ".ws.json"
+    if not path.exists():
+        path.write_text(json.dumps({"_comment": "Per-repo ws config. See ~/.config/ws/docs/per-repo-config.md.", "clone_args": [], "post_clone": [], "data": []}, indent=2) + "\n")
+    editor = os.environ.get("EDITOR", "vi")
+    rc = await run_foreground([editor, str(path)])
+    try:
+        json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        ui.err(f"{path} is not valid JSON: {exc}")
+        return 1
+    return rc
+
+
+async def cmd_adopt(args: list[str], config: dict[str, Any], ui: UI) -> int:
+    dry = "--dry-run" in args
+    revert = "--revert" in args
+    only_category = ""
+    single = ""
+    i = 0
+    while i < len(args):
+        if args[i] == "--only-category" and i + 1 < len(args):
+            only_category = args[i + 1]
+            i += 2
+        elif args[i].startswith("--"):
+            i += 1
+        elif not single:
+            single = args[i]
+            i += 1
+        else:
+            i += 1
+    config_path = Path(os.environ.get("WS_CONFIG", DEFAULT_CONFIG))
+    if revert:
+        backups = sorted(config_path.parent.glob(config_path.name + ".bak-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not backups:
+            ui.err("no config backup to revert from")
+            return 1
+        shutil.copyfile(backups[0], config_path)
+        ui.ok(f"reverted {config_path} from {backups[0]}")
+        return 0
+    rows = await classify_workspace(config)
+    rows = [r for r in rows if r["category"] in {"third-party", "local-only", "data", "loose"}]
+    if only_category:
+        rows = [r for r in rows if r["category"] == only_category]
+    if single:
+        rows = [r for r in rows if r["name"] == single]
+    if not rows:
+        ui.print("nothing to adopt")
+        return 0
+    backup = None if dry else config_backup(config_path)
+    for row in rows:
+        name = row["name"]
+        cat = row["category"]
+        if dry:
+            print(f"would review {name} ({cat})")
+            continue
+        if cat == "third-party":
+            config.setdefault("adopted_repos", {})[name] = {"kind": "third-party", "origin": row.get("origin", ""), "adopted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            print(f"marked {name} adopted third-party")
+        elif cat == "loose":
+            print(f"left loose file {name}")
+        else:
+            print(f"left {name} ({cat})")
+    if not dry:
+        write_config(config_path, config)
+        print(f"backup: {backup}")
+    return 0
+
+
+async def cmd_data_rsync(sub: str, args: list[str], config: dict[str, Any], ui: UI, jobs: int) -> int:
+    dry = "--dry-run" in args
+    delete = "--delete" in args
+    itemize = "--itemize" in args
+    positional = [a for a in args if not a.startswith("--")]
+    project_filter = positional[0] if positional else ""
+    surfaces = [(repo, s) for repo, s in collect_data_surfaces(config, project_filter) if s.get("mode") == "rsync"]
+    if not surfaces:
+        ui.print("No rsync data surfaces matched.")
+        return 0
+    async def one(item: tuple[Path, dict[str, Any]]):
+        repo, surface = item
+        ds = data_source(config, str(surface.get("source") or "")) or {}
+        host = str(ds.get("host") or "")
+        remote_path = str(ds.get("remote_path") or "")
+        remote = str(surface.get("remote") or repo.name)
+        local = expand_path(str(surface.get("local") or f"~/workspace-data/{repo.name}"))
+        rsync_args = [str(x) for x in (ds.get("rsync_args") or ["-a", "--partial"])]
+        for ex in ds.get("exclude") or []:
+            rsync_args.append(f"--exclude={ex}")
+        if itemize:
+            rsync_args.append("--itemize-changes")
+        if delete:
+            rsync_args.append("--delete")
+        if dry:
+            rsync_args.append("--dry-run")
+        if sub == "pull":
+            local.mkdir(parents=True, exist_ok=True)
+            cmd = ["rsync", *rsync_args, f"{host}:{remote_path.rstrip('/')}/{remote}/", str(local) + "/"]
+        else:
+            if surface.get("direction", "pull-only") != "push-explicit":
+                return repo.name, RunResult([], 1, "", "push not allowed")
+            dry_args = [a for a in rsync_args if a != "--dry-run"] + ["--dry-run"]
+            preview = await run_cmd(["rsync", *dry_args, str(local) + "/", f"{host}:{remote_path.rstrip('/')}/{remote}/"])
+            if preview.returncode != 0 or dry or not confirm(f"Push {repo.name}:{surface.get('path')}?"):
+                return repo.name, preview
+            cmd = ["rsync", *rsync_args, str(local) + "/", f"{host}:{remote_path.rstrip('/')}/{remote}/"]
+        result = await run_cmd(cmd)
+        return repo.name, result
+    results = await gather_limited(surfaces, jobs or NETWORK_JOBS, one)
+    rc = 0
+    for name, result in results:
+        if result.returncode != 0:
+            rc = result.returncode
+            ui.err(f"{name}: {(result.stderr or result.stdout).strip()}")
+    return rc
+
+
 async def cmd_init(args: list[str], config_path: Path, ui: UI) -> int:
     BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
     if not config_path.exists() and CONFIG_EXAMPLE.exists():
@@ -1141,20 +1826,6 @@ async def cmd_version() -> int:
     return 0
 
 
-async def fallback(args: list[str]) -> int:
-    if not LEGACY.exists():
-        print(f"ws: legacy fallback missing: {LEGACY}", file=sys.stderr)
-        return 127
-    proc = await asyncio.create_subprocess_exec(
-        str(LEGACY),
-        *args,
-        stdin=None,
-        stdout=None,
-        stderr=None,
-    )
-    return await proc.wait()
-
-
 HELP = """ws — async workspace sync over GitHub, Tailscale git, and server-backed data dirs
 
 USAGE
@@ -1175,8 +1846,7 @@ OTHER
   upgrade                git pull --ff-only in ~/.config/ws
   --version              Show version
 
-Rare lifecycle commands currently delegate to ws.legacy: new, clone, push, prune,
-stale, size, init-remote, reclone, explain, adopt, config.
+All commands are implemented in the Python CLI; ws.legacy has been removed.
 """
 
 
@@ -1300,8 +1970,30 @@ async def amain(argv: list[str]) -> int:
             return await cmd_doctor(args, config, ui, jobs or STATUS_JOBS)
         if command == "list":
             return await cmd_list(args, config, ui, jobs or STATUS_JOBS)
-        if command in {"new", "clone", "push", "prune", "stale", "size", "init-remote", "reclone", "explain", "adopt", "config", "cd"}:
-            return await fallback([command, *args])
+        if command == "cd":
+            return await cmd_cd(args, config, ui)
+        if command == "clone":
+            return await cmd_clone(args, config, ui)
+        if command == "new":
+            return await cmd_new(args, config, ui)
+        if command == "push":
+            return await cmd_push(args, config, ui, jobs or PUSH_JOBS)
+        if command == "prune":
+            return await cmd_prune(args, config, ui)
+        if command == "stale":
+            return await cmd_stale(args, config, ui, jobs or STATUS_JOBS)
+        if command == "size":
+            return await cmd_size(args, config, ui, jobs or STATUS_JOBS)
+        if command == "init-remote":
+            return await cmd_init_remote(args, config, ui)
+        if command == "reclone":
+            return await cmd_reclone(args, config, ui)
+        if command == "explain":
+            return await cmd_explain(args, config, ui)
+        if command == "config":
+            return await cmd_config(args, config, ui)
+        if command == "adopt":
+            return await cmd_adopt(args, config, ui)
         ui.err(f"unknown command: {command}")
         print(HELP)
         return 2

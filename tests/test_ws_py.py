@@ -52,6 +52,11 @@ class WsPureTests(unittest.TestCase):
             os.symlink(str(target), str(link))
             self.assertEqual(ws.expand_path(str(link)), link)
 
+
+    def test_no_legacy_fallback_constant(self):
+        self.assertFalse(hasattr(ws, "LEGACY"))
+        self.assertFalse((ROOT / "ws.legacy").exists())
+
     def test_resolve_link_target_remote(self):
         config = {
             "data_sources": [
