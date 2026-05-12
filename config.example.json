@@ -17,7 +17,13 @@
     }
   ],
 
-  "data_sources": [],
+  "data_sources": [
+    {
+      "name": "data-mount",
+      "type": "mount-link",
+      "mount_root": "/data"
+    }
+  ],
 
   "projects": {
     "ws": {

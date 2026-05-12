@@ -479,6 +479,24 @@ project_data_surfaces() {
   jq -c '.data // [] | .[]' <<<"$legacy"
 }
 
+resolve_link_target() {
+  local pname="$1" surface="$2" ds="$3"
+  local surface_path=$(jq -r '.path' <<<"$surface")
+  local remote=$(jq -r '.remote // empty' <<<"$surface")
+  local local_path=$(jq -r '.local // empty' <<<"$surface")
+  local mount_root=$(jq -r '.mount_root // empty' <<<"$ds")
+
+  if [[ -n "$local_path" ]]; then
+    expand_path "$local_path"
+  elif [[ -n "$remote" && -n "$mount_root" ]]; then
+    print -r -- "$mount_root/$remote"
+  elif [[ -n "$mount_root" ]]; then
+    print -r -- "$mount_root/$pname/$surface_path"
+  else
+    print -r -- ""
+  fi
+}
+
 # Legacy helper retained for cmd_explain — returns merged effective config.
 cfg_project_get_effective() {
   _load_project_config "$1"
@@ -782,14 +800,16 @@ _materialize_link_surfaces() {
     [[ "$mode" != "link" ]] && continue
     local surf_path=$(jq -r '.path' <<<"$surface")
     local src_name=$(jq -r '.source' <<<"$surface")
-    local local_p=$(jq -r '.local // empty' <<<"$surface")
     local ds=$(cfg_data_source_by_name "$src_name")
     [[ -z "$ds" ]] && { warn "$name:$surf_path references unknown data_source '$src_name'"; continue; }
     local mount_root=$(jq -r '.mount_root // empty' <<<"$ds")
-    local resolved=$(expand_path "$local_p")
-    [[ -z "$resolved" && -n "$mount_root" ]] && resolved="$mount_root/$name/$surf_path"
+    local resolved=$(resolve_link_target "$name" "$surface" "$ds")
     if [[ ! -d "$mount_root" ]]; then
       warn "$name:$surf_path mount '$mount_root' not available — skipping link"
+      continue
+    fi
+    if [[ -z "$resolved" ]]; then
+      warn "$name:$surf_path cannot resolve link target — skipping link"
       continue
     fi
     local link_path="$dir/$surf_path"
@@ -800,6 +820,7 @@ _materialize_link_surfaces() {
       warn "$name:$surf_path real path exists at $link_path; not overwriting"
       continue
     fi
+    mkdir -p "${link_path:h}" 2>>"$log_file" || { warn "failed to create parent for $name:$surf_path"; continue; }
     ln -sf "$resolved" "$link_path" 2>>"$log_file" \
       && info "linked $name:$surf_path -> $resolved" \
       || warn "failed to link $name:$surf_path"
@@ -1846,12 +1867,14 @@ data_one() {
     link)
       [[ "$ds_type" != "mount-link" ]] && warn "$pname:$surface_path mode=link expects mount-link source (got $ds_type)"
       local mount_root=$(jq -r '.mount_root // empty' <<<"$ds")
-      local resolved_local=$(expand_path "$local_path")
+      local resolved_local=$(resolve_link_target "$pname" "$surface" "$ds")
 
       case "$sub" in
         status|plan)
           if [[ ! -d "$mount_root" ]]; then
             print -r -- "  ${C_Y}$pname:$surface_path${C_0}  link  mount missing ($mount_root)"
+          elif [[ -z "$resolved_local" ]]; then
+            print -r -- "  ${C_Y}$pname:$surface_path${C_0}  link  cannot resolve target"
           elif [[ ! -e "$resolved_local" ]]; then
             print -r -- "  ${C_Y}$pname:$surface_path${C_0}  link  source missing ($resolved_local)"
           elif [[ -L "$link_path" && "$(readlink "$link_path")" == "$resolved_local" ]]; then
@@ -1865,6 +1888,10 @@ data_one() {
         link)
           if [[ ! -d "$mount_root" ]]; then
             warn "$pname:$surface_path mount missing: $mount_root — skipping"
+            return 0
+          fi
+          if [[ -z "$resolved_local" ]]; then
+            warn "$pname:$surface_path cannot resolve link target — skipping"
             return 0
           fi
           if [[ ! -e "$resolved_local" ]]; then
@@ -1883,6 +1910,7 @@ data_one() {
             return 0
           fi
           [[ -d "$repo_dir" ]] || { warn "$pname: repo dir missing ($repo_dir); skipping link"; return 0; }
+          mkdir -p "${link_path:h}"
           ln -sf "$resolved_local" "$link_path"
           ok "linked $link_path -> $resolved_local"
           ;;
