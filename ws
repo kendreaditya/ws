@@ -218,6 +218,8 @@ def repo_matches_source(origin: str, source: dict[str, Any]) -> bool:
 
 
 def is_git_repo(path: Path) -> bool:
+    if path.is_symlink():
+        return False
     return (path / ".git").exists()
 
 
@@ -236,6 +238,8 @@ def local_repos(config: dict[str, Any], only: str = "", source_filter: str = "")
     sources = {s.get("name"): s for s in config.get("sources") or []}
     repos: list[Path] = []
     for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
+        if child.is_symlink():
+            continue
         if not is_git_repo(child) or skipped(config, child.name):
             continue
         if only and not fnmatch.fnmatch(child.name, only):
@@ -823,6 +827,8 @@ def collect_data_surfaces(config: dict[str, Any], project_filter: str = "") -> l
     by_project: dict[str, Path] = {}
     if target.exists():
         for repo in target.iterdir():
+            if repo.is_symlink():
+                continue
             if repo.is_dir() and (repo / ".ws.json").exists():
                 cfg = read_repo_config(repo)
                 if isinstance(cfg.get("data"), list) and cfg.get("data"):

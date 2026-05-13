@@ -52,6 +52,15 @@ class WsPureTests(unittest.TestCase):
             os.symlink(str(target), str(link))
             self.assertEqual(ws.expand_path(str(link)), link)
 
+    def test_symlink_is_not_treated_as_git_repo(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "data"
+            link = root / "workspace-link"
+            target.mkdir()
+            os.symlink(str(target), str(link))
+            self.assertFalse(ws.is_git_repo(link))
+
 
     def test_no_legacy_fallback_constant(self):
         self.assertFalse(hasattr(ws, "LEGACY"))
