@@ -1844,7 +1844,9 @@ async def mount_source(ds: dict[str, Any], ui: UI) -> bool:
     if not sshfs:
         ui.err("sshfs not found")
         return False
-    result = await run_cmd([sshfs, "-s", remote, str(path), "-o", "reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,volname=data,no_readahead,sync_readdir,direct_io"], timeout=15)
+    # nobrowse hides the volume from Finder so transient SSH drops don't trigger
+    # the macOS "Server connections interrupted" dialog (sshfs reconnects silently).
+    result = await run_cmd([sshfs, "-s", remote, str(path), "-o", "reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,volname=data,nobrowse,no_readahead,sync_readdir,direct_io"], timeout=15)
     if result.returncode != 0:
         ui.err((result.stderr or result.stdout).strip() or f"failed to mount {remote} at {path}")
         return False
