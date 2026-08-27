@@ -206,7 +206,8 @@ def urls_equivalent(a: str, b: str) -> bool:
 def source_pattern(source: dict[str, Any]) -> str:
     stype = source.get("type")
     if stype == "github-list":
-        return rf"github\.com[:/]{re.escape(str(source.get('owner', '')))}/"
+        host = str(source.get("host") or "github.com")
+        return rf"{re.escape(host)}[:/]{re.escape(str(source.get('owner', '')))}/"
     if stype == "ssh-glob":
         return re.escape(f"{source.get('host')}:{source.get('path')}")
     return ""
@@ -279,6 +280,7 @@ async def run_cmd(
     cwd: Path | None = None,
     timeout: float | None = None,
     input_text: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> RunResult:
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -286,6 +288,7 @@ async def run_cmd(
         stdin=asyncio.subprocess.PIPE if input_text is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
@@ -418,6 +421,29 @@ async def cmd_status(args: list[str], config: dict[str, Any], ui: UI, jobs: int)
 async def discover_github(source: dict[str, Any]) -> list[RepoSpec]:
     owner = str(source.get("owner") or "")
     clone_protocol = str(source.get("clone_protocol") or "https")
+    host = str(source.get("host") or "")
+    env = {**os.environ, "GH_HOST": host} if host else None
+
+    # An explicit `repos` allowlist skips org-wide discovery entirely: no gh
+    # repo list call, no 1000-repo API fetch/pagination cap. Built for hosts
+    # where `owner` is an org with far more repos than the few you actually
+    # want tracked (e.g. a company GHE org) -- github-list without `repos`
+    # discovers EVERY repo the owner has, which is correct for a personal
+    # account but not for an org you don't want to fully mirror locally.
+    allow = source.get("repos")
+    if allow:
+        real_host = host or "github.com"
+        specs: list[RepoSpec] = []
+        for repo_name in allow:
+            repo_name = str(repo_name)
+            url = (
+                f"git@{real_host}:{owner}/{repo_name}.git"
+                if clone_protocol == "ssh"
+                else f"https://{real_host}/{owner}/{repo_name}"
+            )
+            specs.append(RepoSpec(name=repo_name, url=url, source=source))
+        return specs
+
     result = await run_cmd(
         [
             "gh",
@@ -428,7 +454,8 @@ async def discover_github(source: dict[str, Any]) -> list[RepoSpec]:
             "1000",
             "--json",
             "name,url,sshUrl,isArchived,isFork",
-        ]
+        ],
+        env=env,
     )
     if result.returncode != 0:
         raise WsError(f"gh repo list failed for {owner}: {result.stderr.strip()}")
@@ -1183,16 +1210,18 @@ def confirm(prompt: str) -> bool:
     return answer in {"y", "yes"}
 
 
-async def run_foreground(args: list[str], cwd: Path | None = None) -> int:
-    proc = await asyncio.create_subprocess_exec(*args, cwd=str(cwd) if cwd else None)
+async def run_foreground(args: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> int:
+    proc = await asyncio.create_subprocess_exec(*args, cwd=str(cwd) if cwd else None, env=env)
     return await proc.wait()
 
 
 async def setup_github_remote(config: dict[str, Any], name: str, repo: Path, public: bool, description: str, ui: UI) -> int:
     source = source_by_name(config, "github") or source_by_name(config, cfg_default(config, "new_remote")) or {}
     owner = str(source.get("owner") or "")
+    host = str(source.get("host") or "")
+    env = {**os.environ, "GH_HOST": host} if host else None
     if not owner:
-        who = await run_cmd(["gh", "api", "user", "--jq", ".login"])
+        who = await run_cmd(["gh", "api", "user", "--jq", ".login"], env=env)
         owner = who.stdout.strip() if who.returncode == 0 else ""
     if not owner:
         ui.err("could not resolve GitHub owner")
@@ -1203,7 +1232,7 @@ async def setup_github_remote(config: dict[str, Any], name: str, repo: Path, pub
     if description:
         gh_args += ["--description", description]
     ui.info(f"gh repo create {owner}/{name}")
-    return await run_foreground(["gh", "repo", "create", f"{owner}/{name}", *gh_args, "--source=.", "--push"], cwd=repo)
+    return await run_foreground(["gh", "repo", "create", f"{owner}/{name}", *gh_args, "--source=.", "--push"], cwd=repo, env=env)
 
 
 async def setup_homelab_remote(config: dict[str, Any], name: str, repo: Path, branch: str, ui: UI) -> int:
