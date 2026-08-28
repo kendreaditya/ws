@@ -64,6 +64,7 @@ class RepoStatus:
     failed: bool = False
     error: str = ""
     raw: str = ""
+    bare: bool = False
 
     @property
     def clean(self) -> bool:
@@ -85,6 +86,7 @@ class RepoStatus:
             "diverged": self.diverged,
             "failed": self.failed,
             "error": self.error,
+            "bare": self.bare,
         }
 
 
@@ -218,10 +220,14 @@ def repo_matches_source(origin: str, source: dict[str, Any]) -> bool:
     return bool(pattern and re.search(pattern, origin))
 
 
+def is_bare_repo(path: Path) -> bool:
+    return (path / "HEAD").is_file() and (path / "objects").is_dir() and (path / "refs").is_dir()
+
+
 def is_git_repo(path: Path) -> bool:
     if path.is_symlink():
         return False
-    return (path / ".git").exists()
+    return (path / ".git").exists() or is_bare_repo(path)
 
 
 def is_workspace_symlink(path: Path) -> bool:
@@ -323,6 +329,18 @@ async def git(repo: Path, *args: str) -> RunResult:
 
 
 async def repo_status(repo: Path) -> RepoStatus:
+    if is_bare_repo(repo):
+        # `git status` unconditionally exits 128 ("this operation must be run
+        # in a work tree") against a bare/mirror repo -- confirmed live, it
+        # does not degrade gracefully. There's no working tree to be dirty,
+        # and a mirror clone sets no branch.*.merge tracking config, so
+        # ahead/behind (which mean "vs. my tracked upstream branch") aren't
+        # meaningful either -- a mirror's refs are kept in exact sync by
+        # `fetch` itself. Just report bare + the current HEAD branch name.
+        rs = RepoStatus(name=repo.name, path=repo, bare=True)
+        head = await git(repo, "symbolic-ref", "--short", "HEAD")
+        rs.branch = head.stdout.strip() if head.returncode == 0 else ""
+        return rs
     status = await git(repo, "status", "--porcelain=v1", "-b")
     rs = RepoStatus(name=repo.name, path=repo)
     if status.returncode != 0:
@@ -352,9 +370,12 @@ async def repo_status(repo: Path) -> RepoStatus:
 
 def render_status(ui: UI, statuses: list[RepoStatus], verbose: bool = False) -> None:
     failed = [s for s in statuses if s.failed]
-    dirty = [s for s in statuses if s.dirty and not s.failed]
-    ahead = [s for s in statuses if s.ahead and not s.failed]
-    behind = [s for s in statuses if s.behind and not s.failed]
+    # dirty/ahead/behind are never populated for a bare repo (see repo_status),
+    # so these filters are redundant with `not s.bare` today -- kept explicit
+    # so intent doesn't depend on that coincidence.
+    dirty = [s for s in statuses if s.dirty and not s.failed and not s.bare]
+    ahead = [s for s in statuses if s.ahead and not s.failed and not s.bare]
+    behind = [s for s in statuses if s.behind and not s.failed and not s.bare]
     clean = [s for s in statuses if s.clean]
 
     if verbose:
@@ -512,14 +533,32 @@ async def discover_all_code(config: dict[str, Any], source_filter: str = "", onl
     return [by_name[k] for k in sorted(by_name, key=str.lower)]
 
 
+def resolve_bare(config: dict[str, Any], spec: RepoSpec) -> bool:
+    override = project_override(config, spec.name)
+    legacy = project_legacy(config, spec.name)
+    if "bare" in override:
+        return bool(override["bare"])
+    if "bare" in legacy:
+        return bool(legacy["bare"])
+    return bool(spec.source.get("bare"))
+
+
 def clone_args(config: dict[str, Any], spec: RepoSpec) -> list[str]:
     override = project_override(config, spec.name)
     legacy = project_legacy(config, spec.name)
     if isinstance(override.get("clone_args"), list):
-        return [str(x) for x in override["clone_args"]]
-    if isinstance(legacy.get("clone_args"), list):
-        return [str(x) for x in legacy["clone_args"]]
-    return [str(x) for x in spec.source.get("clone_args") or []]
+        args = [str(x) for x in override["clone_args"]]
+    elif isinstance(legacy.get("clone_args"), list):
+        args = [str(x) for x in legacy["clone_args"]]
+    else:
+        args = [str(x) for x in spec.source.get("clone_args") or []]
+    # `--bare` alone sets no fetch refspec (confirmed live: `git clone --bare`
+    # leaves remote.origin.fetch empty, so a later `git fetch` only updates
+    # FETCH_HEAD and local refs never advance). `--mirror` is bare AND sets
+    # `+refs/*:refs/*`, so `ws sync`'s plain `fetch` actually keeps it current.
+    if resolve_bare(config, spec) and "--mirror" not in args and "--bare" not in args:
+        args = [*args, "--mirror"]
+    return args
 
 
 def fetch_args(spec: RepoSpec) -> list[str]:
@@ -733,7 +772,12 @@ async def cmd_pull(args: list[str], config: dict[str, Any], ui: UI, jobs: int) -
         return 2
     repos = local_repos(config)
     statuses = await gather_limited(repos, jobs or STATUS_JOBS, repo_status)
-    pullable = [s for s in statuses if not s.failed and s.dirty == 0 and s.behind > 0 and s.ahead == 0]
+    # `git pull --ff-only` is meaningless against a bare/mirror repo: there's
+    # no working tree to fast-forward into. bare repos never show behind>0
+    # (repo_status doesn't compute it for them), so they're already excluded
+    # from `pullable` -- filtered explicitly here so that's not an accident.
+    bare_repos = [s for s in statuses if s.bare]
+    pullable = [s for s in statuses if not s.failed and not s.bare and s.dirty == 0 and s.behind > 0 and s.ahead == 0]
     skipped_dirty = [s for s in statuses if s.dirty]
     skipped_diverged = [s for s in statuses if s.diverged]
     failed: list[tuple[str, str]] = []
@@ -755,6 +799,7 @@ async def cmd_pull(args: list[str], config: dict[str, Any], ui: UI, jobs: int) -
     attention_names.update(s.name for s in skipped_dirty)
     attention_names.update(s.name for s in skipped_diverged)
     attention_names.update(name for name, _detail in failed)
+    attention_names.update(s.name for s in bare_repos)
     already_current = max(0, len(statuses) - len(attention_names))
 
     ui.print("Safe pull complete.")
@@ -764,6 +809,8 @@ async def cmd_pull(args: list[str], config: dict[str, Any], ui: UI, jobs: int) -
     ui.print(f"Skipped dirty:    {len(skipped_dirty)}")
     ui.print(f"Skipped diverged: {len(skipped_diverged)}")
     ui.print(f"Failed:           {len(failed)}")
+    if bare_repos:
+        ui.print(f"Skipped bare:     {len(bare_repos)} (use `ws git -- fetch` instead)")
     if skipped_dirty or skipped_diverged or failed:
         ui.print("")
         for s in skipped_dirty:
@@ -1023,6 +1070,7 @@ async def classify_workspace(config: dict[str, Any]) -> list[dict[str, Any]]:
             origin = await git(child, "remote", "get-url", "origin")
             origin_s = origin.stdout.strip() if origin.returncode == 0 else ""
             row["origin"] = origin_s
+            row["bare"] = is_bare_repo(child)
             adopted = (config.get("adopted_repos") or {}).get(name) or {}
             if adopted:
                 row["category"] = "adopted"
@@ -1291,6 +1339,7 @@ async def cmd_cd(args: list[str], config: dict[str, Any], ui: UI) -> int:
 async def cmd_clone(args: list[str], config: dict[str, Any], ui: UI) -> int:
     adopt_kind = "third-party"
     no_adopt = False
+    bare = False
     url = ""
     i = 0
     while i < len(args):
@@ -1304,8 +1353,11 @@ async def cmd_clone(args: list[str], config: dict[str, Any], ui: UI) -> int:
         elif arg == "--no-adopt":
             no_adopt = True
             i += 1
+        elif arg == "--bare":
+            bare = True
+            i += 1
         elif arg in {"-h", "--help"}:
-            print("Usage: ws clone [--kind third-party|fork-backed|owned] [--no-adopt] <url>")
+            print("Usage: ws clone [--kind third-party|fork-backed|owned] [--no-adopt] [--bare] <url>")
             return 0
         elif arg.startswith("-"):
             ui.err(f"ws clone: unknown flag '{arg}'")
@@ -1317,7 +1369,7 @@ async def cmd_clone(args: list[str], config: dict[str, Any], ui: UI) -> int:
             ui.err(f"ws clone: extra arg '{arg}'")
             return 2
     if not url:
-        ui.err("Usage: ws clone [--kind third-party|fork-backed|owned] [--no-adopt] <url>")
+        ui.err("Usage: ws clone [--kind third-party|fork-backed|owned] [--no-adopt] [--bare] <url>")
         return 2
     if adopt_kind not in {"third-party", "fork-backed", "owned"}:
         ui.err(f"ws clone: invalid --kind '{adopt_kind}'")
@@ -1338,7 +1390,10 @@ async def cmd_clone(args: list[str], config: dict[str, Any], ui: UI) -> int:
         ui.err(f"{repo} already exists")
         return 1
     spec = RepoSpec(name=name, url=url, source=source)
-    rc = await run_foreground(["git", "clone", *clone_args(config, spec), url, str(repo)])
+    args_for_clone = clone_args(config, spec)
+    if bare and "--mirror" not in args_for_clone and "--bare" not in args_for_clone:
+        args_for_clone = [*args_for_clone, "--mirror"]
+    rc = await run_foreground(["git", "clone", *args_for_clone, url, str(repo)])
     if rc != 0:
         return rc
     if external_github and not no_adopt:
@@ -1357,6 +1412,7 @@ async def cmd_new(args: list[str], config: dict[str, Any], ui: UI) -> int:
     description = ""
     branch = "main"
     with_data = False
+    bare = False
     i = 0
     while i < len(args):
         arg = args[i]
@@ -1378,8 +1434,11 @@ async def cmd_new(args: list[str], config: dict[str, Any], ui: UI) -> int:
         elif arg == "--with-data":
             with_data = True
             i += 1
+        elif arg == "--bare":
+            bare = True
+            i += 1
         elif arg in {"-h", "--help"}:
-            print("Usage: ws new <name> [--remote <r>] [--public] [--template <t>] [--description <s>] [--branch <b>] [--with-data]")
+            print("Usage: ws new <name> [--remote <r>] [--public] [--template <t>] [--description <s>] [--branch <b>] [--with-data] [--bare]")
             return 0
         elif arg.startswith("-"):
             ui.err(f"ws new: unknown flag '{arg}'")
@@ -1398,13 +1457,30 @@ async def cmd_new(args: list[str], config: dict[str, Any], ui: UI) -> int:
     if remote not in {"github", "homelab", "none"}:
         ui.err("--remote must be github | homelab | none")
         return 2
+    if bare:
+        # A bare repo has no working tree: nothing to check template files
+        # into, nowhere for --with-data to write .ws.json, and nothing
+        # committed to `gh repo create --source=. --push` from.
+        if with_data:
+            ui.err("ws new: --bare is incompatible with --with-data (a bare repo has no working tree to write .ws.json into)")
+            return 2
+        if template not in {"", "none"}:
+            ui.err(f"ws new: --bare is incompatible with --template '{template}' (a bare repo has no working tree to check files into); use --template none")
+            return 2
+        template = "none"
+        if remote == "github":
+            ui.err("ws new: --bare cannot use --remote github (gh repo create --push needs a committed working tree); use --remote homelab or --remote none")
+            return 2
     target = target_dir(config)
     repo = target / name
     if path_exists_or_link(repo):
         ui.err(f"{repo} already exists")
         return 1
     repo.mkdir(parents=True)
-    await git(repo, "init", "-b", branch, "-q")
+    if bare:
+        await git(repo, "init", "--bare", "-b", branch, "-q")
+    else:
+        await git(repo, "init", "-b", branch, "-q")
     tpl_dir = WS_HOME / "templates" / template
     if template and template != "none":
         if not tpl_dir.exists():
@@ -1422,7 +1498,7 @@ async def cmd_new(args: list[str], config: dict[str, Any], ui: UI) -> int:
                 path.write_text(text.replace("{{name}}", name).replace("{{description}}", description or "A new project"))
     if with_data:
         (repo / ".ws.json").write_text(json.dumps({"_comment": "Per-repo ws config. See ~/.config/ws/docs/per-repo-config.md.", "clone_args": [], "post_clone": [], "data": []}, indent=2) + "\n")
-    if any(p.name != ".git" for p in repo.iterdir()):
+    if not bare and any(p.name != ".git" for p in repo.iterdir()):
         await git(repo, "add", "-A")
         await run_cmd(["git", "-C", str(repo), "-c", "user.useConfigOnly=false", "commit", "-q", "-m", "init"])
     if remote == "github":
@@ -1606,6 +1682,7 @@ async def cmd_reclone(args: list[str], config: dict[str, Any], ui: UI) -> int:
     if not is_git_repo(repo):
         ui.err(f"{name} is not a git repo at {repo}")
         return 1
+    was_bare = is_bare_repo(repo)
     origin = (await git(repo, "remote", "get-url", "origin")).stdout.strip()
     source = match_source_by_url(config, origin)
     if not origin or not source:
@@ -1614,7 +1691,13 @@ async def cmd_reclone(args: list[str], config: dict[str, Any], ui: UI) -> int:
     backup = repo.with_name(f"{repo.name}.bak-{int(time.time())}")
     shutil.move(str(repo), str(backup))
     spec = RepoSpec(name=name, url=origin, source=source)
-    rc = await run_foreground(["git", "clone", *clone_args(config, spec), origin, str(repo)])
+    # Preserve bare-ness from the directory itself, not just config: a repo
+    # may have been made bare by hand, so this doesn't require the source to
+    # declare `bare: true` to keep behaving correctly on reclone.
+    args_for_clone = clone_args(config, spec)
+    if was_bare and "--mirror" not in args_for_clone and "--bare" not in args_for_clone:
+        args_for_clone = [*args_for_clone, "--mirror"]
+    rc = await run_foreground(["git", "clone", *args_for_clone, origin, str(repo)])
     if rc != 0:
         if repo.exists():
             shutil.rmtree(repo)
